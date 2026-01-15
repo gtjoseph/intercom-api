@@ -251,8 +251,15 @@ void IntercomApi::server_task_() {
   }
 
   while (true) {
-    // Wait for activation or check periodically
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+    // When streaming, don't wait - poll as fast as possible
+    // When idle, wait up to 100ms to save CPU
+    if (this->client_.streaming) {
+      // During streaming: just check notification without blocking
+      ulTaskNotifyTake(pdTRUE, 0);  // Non-blocking
+    } else {
+      // When idle: wait for activation signal
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+    }
 
     // Client mode - only connect when active
     if (this->client_mode_) {
