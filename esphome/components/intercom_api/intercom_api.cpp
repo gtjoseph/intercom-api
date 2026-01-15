@@ -21,8 +21,9 @@ void IntercomApi::setup() {
   this->client_mutex_ = xSemaphoreCreateMutex();
   this->mic_mutex_ = xSemaphoreCreateMutex();
   this->speaker_mutex_ = xSemaphoreCreateMutex();
+  this->send_mutex_ = xSemaphoreCreateMutex();
 
-  if (!this->client_mutex_ || !this->mic_mutex_ || !this->speaker_mutex_) {
+  if (!this->client_mutex_ || !this->mic_mutex_ || !this->speaker_mutex_ || !this->send_mutex_) {
     ESP_LOGE(TAG, "Failed to create mutexes");
     this->mark_failed();
     return;
@@ -214,21 +215,23 @@ void IntercomApi::server_task(void *param) {
 void IntercomApi::server_task_() {
   ESP_LOGI(TAG, "Server task started");
 
+  // In server mode, always set up the listening socket immediately
+  if (!this->client_mode_) {
+    if (!this->setup_server_socket_()) {
+      ESP_LOGE(TAG, "Failed to setup server socket on startup");
+    }
+  }
+
   while (true) {
     // Wait for activation or check periodically
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
-    if (!this->active_.load(std::memory_order_acquire)) {
-      // Not active - ensure server socket is closed
-      if (this->server_socket_ >= 0) {
-        this->close_server_socket_();
-      }
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
-
-    // Client mode - connect to remote
+    // Client mode - only connect when active
     if (this->client_mode_) {
+      if (!this->active_.load(std::memory_order_acquire)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
       if (this->client_.socket < 0) {
         this->state_ = ConnectionState::CONNECTING;
 
@@ -334,8 +337,9 @@ void IntercomApi::server_task_() {
         }
       }
 
-      // Send ping if needed
-      if (millis() - this->client_.last_ping > PING_INTERVAL_MS) {
+      // Send ping if needed - but NOT during streaming to avoid interference with audio
+      if (this->state_ != ConnectionState::STREAMING &&
+          millis() - this->client_.last_ping > PING_INTERVAL_MS) {
         this->send_message_(this->client_.socket, MessageType::PING);
         this->client_.last_ping = millis();
       }
@@ -355,55 +359,92 @@ void IntercomApi::audio_task_() {
   ESP_LOGI(TAG, "Audio task started");
 
   uint8_t audio_chunk[AUDIO_CHUNK_SIZE];
+  uint32_t tx_count = 0;
+  uint32_t no_data_count = 0;
+  uint32_t last_log_ms = 0;
 
   while (true) {
     if (!this->active_.load(std::memory_order_acquire) || this->client_.socket < 0) {
+      if (tx_count > 0) {
+        ESP_LOGI(TAG, "Audio task paused: active=%d socket=%d (sent %lu)",
+                 this->active_.load(), this->client_.socket, (unsigned long)tx_count);
+      }
       vTaskDelay(pdMS_TO_TICKS(50));
+      tx_count = 0;
+      no_data_count = 0;
       continue;
     }
 
     // === TX: Mic buffer → Network ===
-    if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(5)) == pdTRUE) {
-      while (this->mic_buffer_->available() >= AUDIO_CHUNK_SIZE) {
-        size_t read = this->mic_buffer_->read(audio_chunk, AUDIO_CHUNK_SIZE, 0);
+    // Process up to 4 chunks per iteration to keep latency low
+    int chunks_sent = 0;
+    while (chunks_sent < 4) {
+      if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(2)) != pdTRUE) {
+        break;
+      }
+
+      size_t avail = this->mic_buffer_->available();
+      if (avail < AUDIO_CHUNK_SIZE) {
         xSemaphoreGive(this->mic_mutex_);
-
-        if (read == AUDIO_CHUNK_SIZE && this->client_.socket >= 0) {
-          xSemaphoreTake(this->client_mutex_, portMAX_DELAY);
-          this->send_message_(this->client_.socket, MessageType::AUDIO, MessageFlags::NONE,
-                              audio_chunk, AUDIO_CHUNK_SIZE);
-          xSemaphoreGive(this->client_mutex_);
+        no_data_count++;
+        // Log if we've been waiting too long with no mic data
+        if (no_data_count > 0 && (millis() - last_log_ms > 1000)) {
+          ESP_LOGW(TAG, "No mic data: avail=%zu streaming=%d tx_count=%lu",
+                   avail, this->client_.streaming, (unsigned long)tx_count);
+          last_log_ms = millis();
         }
+        break;
+      }
+      no_data_count = 0;
 
-        if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(1)) != pdTRUE) {
+      size_t read = this->mic_buffer_->read(audio_chunk, AUDIO_CHUNK_SIZE, 0);
+      xSemaphoreGive(this->mic_mutex_);
+
+      if (read == AUDIO_CHUNK_SIZE && this->client_.socket >= 0) {
+        // Send without holding mutex
+        bool sent = this->send_message_(this->client_.socket, MessageType::AUDIO, MessageFlags::NONE,
+                                        audio_chunk, AUDIO_CHUNK_SIZE);
+        if (sent) {
+          tx_count++;
+          chunks_sent++;
+          if (tx_count <= 5 || tx_count % 100 == 0) {
+            ESP_LOGD(TAG, "Audio TX #%lu avail=%zu", (unsigned long)tx_count, this->mic_buffer_->available());
+          }
+        } else {
+          ESP_LOGW(TAG, "Audio TX failed at #%lu", (unsigned long)tx_count);
           break;
         }
       }
-      xSemaphoreGive(this->mic_mutex_);
     }
 
     // === RX: Speaker buffer → Speaker ===
 #ifdef USE_SPEAKER
     if (this->speaker_ != nullptr) {
-      if (xSemaphoreTake(this->speaker_mutex_, pdMS_TO_TICKS(5)) == pdTRUE) {
-        while (this->speaker_buffer_->available() >= AUDIO_CHUNK_SIZE) {
-          size_t read = this->speaker_buffer_->read(audio_chunk, AUDIO_CHUNK_SIZE, 0);
-          xSemaphoreGive(this->speaker_mutex_);
-
-          if (read == AUDIO_CHUNK_SIZE && this->volume_ > 0.001f) {
-            this->speaker_->play(audio_chunk, AUDIO_CHUNK_SIZE, pdMS_TO_TICKS(10));
-          }
-
-          if (xSemaphoreTake(this->speaker_mutex_, pdMS_TO_TICKS(1)) != pdTRUE) {
-            break;
-          }
+      // Process up to 4 chunks per iteration
+      int chunks_played = 0;
+      while (chunks_played < 4) {
+        if (xSemaphoreTake(this->speaker_mutex_, pdMS_TO_TICKS(2)) != pdTRUE) {
+          break;
         }
+
+        if (this->speaker_buffer_->available() < AUDIO_CHUNK_SIZE) {
+          xSemaphoreGive(this->speaker_mutex_);
+          break;
+        }
+
+        size_t read = this->speaker_buffer_->read(audio_chunk, AUDIO_CHUNK_SIZE, 0);
         xSemaphoreGive(this->speaker_mutex_);
+
+        if (read == AUDIO_CHUNK_SIZE && this->volume_ > 0.001f) {
+          this->speaker_->play(audio_chunk, AUDIO_CHUNK_SIZE, pdMS_TO_TICKS(20));
+          chunks_played++;
+        }
       }
     }
 #endif
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Short delay to allow other tasks to run
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 
@@ -412,6 +453,12 @@ void IntercomApi::audio_task_() {
 bool IntercomApi::send_message_(int socket, MessageType type, MessageFlags flags,
                                  const uint8_t *data, size_t len) {
   if (socket < 0) return false;
+
+  // Take mutex to protect tx_buffer_ from concurrent access
+  if (xSemaphoreTake(this->send_mutex_, pdMS_TO_TICKS(10)) != pdTRUE) {
+    // Could not get mutex - another task is sending
+    return false;
+  }
 
   MessageHeader header;
   header.type = static_cast<uint8_t>(type);
@@ -425,20 +472,78 @@ bool IntercomApi::send_message_(int socket, MessageType type, MessageFlags flags
   }
 
   size_t total = HEADER_SIZE + len;
-  ssize_t sent = send(socket, this->tx_buffer_, total, 0);
+  size_t offset = 0;
+  uint32_t start_ms = millis();
 
-  if (sent != (ssize_t)total) {
-    ESP_LOGW(TAG, "Send failed: %d (expected %zu)", errno, total);
+  // Handle partial sends with retry
+  while (offset < total) {
+    ssize_t sent = send(socket, this->tx_buffer_ + offset, total - offset, MSG_DONTWAIT);
+
+    if (sent > 0) {
+      offset += (size_t)sent;
+      continue;
+    }
+
+    if (sent == 0) {
+      // Connection closed
+      xSemaphoreGive(this->send_mutex_);
+      return false;
+    }
+
+    // sent < 0
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      // Buffer full - wait briefly and retry
+      if (millis() - start_ms > 20) {
+        // Timeout - skip this packet
+        static uint32_t skip_count = 0;
+        skip_count++;
+        if (skip_count <= 5 || skip_count % 100 == 0) {
+          ESP_LOGW(TAG, "Send timeout, skipped %lu packets", (unsigned long)skip_count);
+        }
+        xSemaphoreGive(this->send_mutex_);
+        return false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
+    }
+
+    // Real error
+    ESP_LOGW(TAG, "Send failed: errno=%d sent=%zd offset=%zu total=%zu", errno, sent, offset, total);
+    xSemaphoreGive(this->send_mutex_);
     return false;
   }
 
+  xSemaphoreGive(this->send_mutex_);
   return true;
 }
 
 bool IntercomApi::receive_message_(int socket, MessageHeader &header, uint8_t *buffer, size_t buffer_size) {
-  // Read header
-  ssize_t received = recv(socket, buffer, HEADER_SIZE, MSG_WAITALL);
-  if (received != HEADER_SIZE) {
+  // Read header with retry for partial reads (non-blocking socket)
+  // Use 500 retries (500ms max) to handle TCP congestion under high bidirectional load
+  size_t header_read = 0;
+  int retry = 0;
+  while (header_read < HEADER_SIZE && retry < 500) {
+    ssize_t received = recv(socket, buffer + header_read, HEADER_SIZE - header_read, 0);
+    if (received < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // No data available yet, wait a bit
+        retry++;
+        vTaskDelay(pdMS_TO_TICKS(1));
+        continue;
+      }
+      // Real error
+      return false;
+    }
+    if (received == 0) {
+      // Connection closed
+      return false;
+    }
+    header_read += received;
+    retry = 0;  // Reset retry on successful read
+  }
+
+  if (header_read != HEADER_SIZE) {
+    ESP_LOGW(TAG, "Header incomplete: got %zu of %d after %d retries", header_read, HEADER_SIZE, retry);
     return false;
   }
 
@@ -450,10 +555,30 @@ bool IntercomApi::receive_message_(int socket, MessageHeader &header, uint8_t *b
     return false;
   }
 
-  // Read payload
+  // Read payload with retry for partial reads
   if (header.length > 0) {
-    received = recv(socket, buffer + HEADER_SIZE, header.length, MSG_WAITALL);
-    if (received != header.length) {
+    size_t payload_read = 0;
+    retry = 0;
+    while (payload_read < header.length && retry < 500) {
+      ssize_t received = recv(socket, buffer + HEADER_SIZE + payload_read,
+                              header.length - payload_read, 0);
+      if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          retry++;
+          vTaskDelay(pdMS_TO_TICKS(1));
+          continue;
+        }
+        return false;
+      }
+      if (received == 0) {
+        return false;
+      }
+      payload_read += received;
+      retry = 0;
+    }
+
+    if (payload_read != header.length) {
+      ESP_LOGW(TAG, "Payload incomplete: got %zu of %d after %d retries", payload_read, header.length, retry);
       return false;
     }
   }
@@ -477,7 +602,22 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
       break;
 
     case MessageType::START:
-      ESP_LOGI(TAG, "Received START");
+      ESP_LOGI(TAG, "Received START from client");
+      // Start microphone/speaker if not already active
+      if (!this->active_.load(std::memory_order_acquire)) {
+        this->active_.store(true, std::memory_order_release);
+#ifdef USE_MICROPHONE
+        if (this->microphone_ != nullptr) {
+          this->microphone_->start();
+        }
+#endif
+#ifdef USE_SPEAKER
+        if (this->speaker_ != nullptr) {
+          this->speaker_->start();
+        }
+#endif
+        this->start_trigger_.trigger();
+      }
       this->client_.streaming = true;
       this->state_ = ConnectionState::STREAMING;
       // Send PONG as ACK
@@ -485,8 +625,23 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
       break;
 
     case MessageType::STOP:
-      ESP_LOGI(TAG, "Received STOP");
+      ESP_LOGI(TAG, "Received STOP from client");
       this->client_.streaming = false;
+      // Stop microphone/speaker
+      if (this->active_.load(std::memory_order_acquire)) {
+        this->active_.store(false, std::memory_order_release);
+#ifdef USE_MICROPHONE
+        if (this->microphone_ != nullptr) {
+          this->microphone_->stop();
+        }
+#endif
+#ifdef USE_SPEAKER
+        if (this->speaker_ != nullptr) {
+          this->speaker_->stop();
+        }
+#endif
+        this->stop_trigger_.trigger();
+      }
       this->state_ = ConnectionState::CONNECTED;
       break;
 
@@ -610,6 +765,11 @@ void IntercomApi::accept_client_() {
   int opt = 1;
   setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+  // Increase send/receive buffer sizes for better throughput
+  int buf_size = 32768;  // 32KB buffer
+  setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+  setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+
   // Set non-blocking
   int flags = fcntl(client_sock, F_GETFL, 0);
   fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
@@ -632,17 +792,106 @@ void IntercomApi::accept_client_() {
 // === Microphone Callback ===
 
 void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
+  static uint32_t callback_count = 0;
+  static uint32_t drop_active = 0;
+  static uint32_t drop_socket = 0;
+  static uint32_t drop_streaming = 0;
+  callback_count++;
+
   if (!this->active_.load(std::memory_order_acquire)) {
+    drop_active++;
+    if (drop_active <= 5 || drop_active % 100 == 0) {
+      ESP_LOGW(TAG, "Mic DROP: not active (total=%lu)", (unsigned long)drop_active);
+    }
     return;
   }
 
-  if (this->client_.socket < 0 || !this->client_.streaming) {
+  if (this->client_.socket < 0) {
+    drop_socket++;
+    if (drop_socket <= 5 || drop_socket % 100 == 0) {
+      ESP_LOGW(TAG, "Mic DROP: socket closed (total=%lu)", (unsigned long)drop_socket);
+    }
     return;
   }
 
-  if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(1)) == pdTRUE) {
-    this->mic_buffer_->write((void *)data, len);
-    xSemaphoreGive(this->mic_mutex_);
+  if (!this->client_.streaming) {
+    drop_streaming++;
+    if (drop_streaming <= 5 || drop_streaming % 100 == 0) {
+      ESP_LOGW(TAG, "Mic DROP: not streaming (total=%lu, socket=%d)",
+               (unsigned long)drop_streaming, this->client_.socket);
+    }
+    return;
+  }
+
+  if (callback_count <= 5 || callback_count % 500 == 0) {
+    ESP_LOGD(TAG, "Mic callback #%lu: len=%zu", (unsigned long)callback_count, len);
+  }
+
+  // Handle based on mic_bits configuration
+  if (this->mic_bits_ == 32) {
+    // 32-bit mic (e.g., SPH0645) - convert to 16-bit
+    const int32_t *samples_32 = reinterpret_cast<const int32_t *>(data);
+    size_t num_samples = len / sizeof(int32_t);
+
+    int16_t converted[256];
+    if (num_samples > 256) num_samples = 256;
+
+    for (size_t i = 0; i < num_samples; i++) {
+      // Extract upper 16 bits
+      int32_t sample = samples_32[i] >> 16;
+
+      // Optional DC offset removal
+      if (this->dc_offset_removal_) {
+        this->dc_offset_ = ((this->dc_offset_ * 255) >> 8) + sample;
+        sample -= (this->dc_offset_ >> 8);
+      }
+
+      // Clamp to int16_t range
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+
+      converted[i] = static_cast<int16_t>(sample);
+    }
+
+    // Increased mutex timeout to avoid dropping audio data
+    if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
+      size_t written = this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
+      xSemaphoreGive(this->mic_mutex_);
+      if (written == 0) {
+        ESP_LOGW(TAG, "Mic buffer full, dropping %zu samples", num_samples);
+      }
+    } else {
+      ESP_LOGW(TAG, "Mic mutex timeout, dropping %zu samples", num_samples);
+    }
+  } else {
+    // 16-bit mic - pass through directly (optional DC offset removal)
+    if (this->dc_offset_removal_) {
+      const int16_t *samples_16 = reinterpret_cast<const int16_t *>(data);
+      size_t num_samples = len / sizeof(int16_t);
+
+      int16_t converted[512];
+      if (num_samples > 512) num_samples = 512;
+
+      for (size_t i = 0; i < num_samples; i++) {
+        int32_t sample = samples_16[i];
+        this->dc_offset_ = ((this->dc_offset_ * 255) >> 8) + sample;
+        sample -= (this->dc_offset_ >> 8);
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        converted[i] = static_cast<int16_t>(sample);
+      }
+
+      if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
+        this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
+        xSemaphoreGive(this->mic_mutex_);
+      }
+    } else {
+      // Direct passthrough
+      if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
+        this->mic_buffer_->write((void *)data, len);
+        xSemaphoreGive(this->mic_mutex_);
+      }
+    }
   }
 }
 

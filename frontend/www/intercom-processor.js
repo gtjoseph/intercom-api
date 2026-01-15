@@ -1,48 +1,112 @@
 /**
  * Intercom AudioWorklet Processor
+ * Based on Home Assistant's recorder-worklet.js
+ * VERSION: 2.2.0 - Larger chunks (1024 samples = 64ms) to reduce WS flood
  *
- * Captures audio from microphone and converts it to PCM format
- * suitable for transmission to ESP32.
+ * This processor runs in a separate audio thread and converts
+ * Float32 audio samples to Int16 PCM format.
  */
 
-class IntercomProcessor extends AudioWorkletProcessor {
+class RecorderProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this._buffer = new Float32Array(256); // 256 samples = 512 bytes at 16-bit
-    this._bufferIndex = 0;
+    this._buffer = [];
+    this._targetSamples = 1024; // 64ms chunks @ 16kHz = ~15 msg/sec (was 256 = 62 msg/sec)
+    this._frameCount = 0;
+    this._chunksSent = 0;
+    this._totalSamplesProcessed = 0;
+
+    // Log initialization
+    console.log("[IntercomProcessor] === INITIALIZED v2.1.0 ===");
+    console.log("[IntercomProcessor] sampleRate:", sampleRate);
+    console.log("[IntercomProcessor] targetSamples:", this._targetSamples);
+
+    // Send init message to main thread
+    this.port.postMessage({
+      type: "debug",
+      message: `Worklet initialized: sampleRate=${sampleRate}, target=${this._targetSamples}`
+    });
   }
 
-  process(inputs, outputs, parameters) {
-    const input = inputs[0];
-    if (!input || !input[0]) return true;
+  process(inputList, _outputList, _parameters) {
+    this._frameCount++;
 
-    const inputChannel = input[0];
+    // Check input validity
+    if (!inputList || inputList.length === 0) {
+      if (this._frameCount % 500 === 0) {
+        console.log("[IntercomProcessor] Frame", this._frameCount, "- no inputList");
+      }
+      return true;
+    }
 
-    for (let i = 0; i < inputChannel.length; i++) {
-      this._buffer[this._bufferIndex++] = inputChannel[i];
+    if (!inputList[0] || inputList[0].length === 0) {
+      if (this._frameCount % 500 === 0) {
+        console.log("[IntercomProcessor] Frame", this._frameCount, "- no channels in inputList[0]");
+      }
+      return true;
+    }
 
-      // When buffer is full, send to main thread
-      if (this._bufferIndex >= this._buffer.length) {
-        // Convert Float32 to Int16 PCM
-        const int16Buffer = new Int16Array(this._buffer.length);
-        for (let j = 0; j < this._buffer.length; j++) {
-          // Clamp and convert to 16-bit signed integer
-          const sample = Math.max(-1, Math.min(1, this._buffer[j]));
-          int16Buffer[j] = Math.round(sample * 32767);
-        }
+    const float32Data = inputList[0][0]; // First channel of first input
+    if (!float32Data || float32Data.length === 0) {
+      if (this._frameCount % 500 === 0) {
+        console.log("[IntercomProcessor] Frame", this._frameCount, "- no data in channel 0");
+      }
+      return true;
+    }
 
-        // Send to main thread
+    // Log periodically
+    if (this._frameCount % 200 === 1) {
+      console.log("[IntercomProcessor] Frame", this._frameCount,
+                  "- samples:", float32Data.length,
+                  "bufferLen:", this._buffer.length,
+                  "chunksSent:", this._chunksSent);
+    }
+
+    // Downsample if needed (48kHz -> 16kHz = take every 3rd sample)
+    // sampleRate is a global in AudioWorklet scope
+    const downsampleFactor = sampleRate > 40000 ? 3 : 1;
+
+    // Accumulate samples
+    for (let i = 0; i < float32Data.length; i += downsampleFactor) {
+      this._buffer.push(float32Data[i]);
+    }
+    this._totalSamplesProcessed += float32Data.length;
+
+    // When we have enough samples, convert and send
+    while (this._buffer.length >= this._targetSamples) {
+      const chunk = this._buffer.splice(0, this._targetSamples);
+
+      // Convert Float32 (-1.0 to 1.0) to Int16 (-32768 to 32767)
+      // Following HA's exact pattern from recorder-worklet.js
+      const int16Data = new Int16Array(chunk.length);
+      for (let i = 0; i < chunk.length; i++) {
+        const s = Math.max(-1, Math.min(1, chunk[i]));
+        int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+
+      this._chunksSent++;
+
+      // Log chunk send
+      if (this._chunksSent <= 5 || this._chunksSent % 50 === 0) {
+        console.log("[IntercomProcessor] Sending chunk", this._chunksSent,
+                    "- samples:", int16Data.length,
+                    "- bytes:", int16Data.buffer.byteLength);
+      }
+
+      // Send to main thread (transferable for performance)
+      try {
         this.port.postMessage({
           type: "audio",
-          buffer: int16Buffer.buffer,
-        }, [int16Buffer.buffer]);
-
-        this._bufferIndex = 0;
+          buffer: int16Data.buffer
+        }, [int16Data.buffer]);
+      } catch (err) {
+        console.error("[IntercomProcessor] postMessage error:", err);
       }
     }
 
-    return true;
+    return true; // Keep processor alive
   }
 }
 
-registerProcessor("intercom-processor", IntercomProcessor);
+registerProcessor("intercom-processor", RecorderProcessor);
+console.log("[IntercomProcessor] Processor registered");

@@ -60,6 +60,8 @@ class IntercomApi : public Component {
 #ifdef USE_SPEAKER
   void set_speaker(speaker::Speaker *spk) { this->speaker_ = spk; }
 #endif
+  void set_mic_bits(int bits) { this->mic_bits_ = bits; }
+  void set_dc_offset_removal(bool enabled) { this->dc_offset_removal_ = enabled; }
 
   // Runtime control
   void start();
@@ -142,6 +144,7 @@ class IntercomApi : public Component {
   // Pre-allocated frame buffers
   uint8_t *tx_buffer_{nullptr};
   uint8_t *rx_buffer_{nullptr};
+  SemaphoreHandle_t send_mutex_{nullptr};  // Protects tx_buffer_ during send
 
   // Task handles
   TaskHandle_t server_task_handle_{nullptr};
@@ -149,6 +152,11 @@ class IntercomApi : public Component {
 
   // Volume
   float volume_{1.0f};
+
+  // Mic configuration
+  int mic_bits_{16};              // 16 or 32 bit mic
+  bool dc_offset_removal_{false}; // Enable for mics with DC bias (SPH0645)
+  int32_t dc_offset_{0};          // Running DC offset value
 
   // Triggers
   Trigger<> connect_trigger_;

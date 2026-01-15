@@ -1,4 +1,7 @@
 """Async TCP client for Intercom Native protocol."""
+# VERSION: 4.1.0 - Fix protocol desync on bad length
+
+MAX_PAYLOAD_SIZE = 2048
 
 import asyncio
 import logging
@@ -17,7 +20,6 @@ from .const import (
     FLAG_NONE,
     CONNECT_TIMEOUT,
     PING_INTERVAL,
-    AUDIO_CHUNK_SIZE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +27,8 @@ _LOGGER = logging.getLogger(__name__)
 
 class IntercomTcpClient:
     """Async TCP client for ESP intercom communication."""
+
+    _instance_counter = 0
 
     def __init__(
         self,
@@ -34,7 +38,9 @@ class IntercomTcpClient:
         on_connected: Optional[Callable[[], None]] = None,
         on_disconnected: Optional[Callable[[], None]] = None,
     ):
-        """Initialize the client."""
+        IntercomTcpClient._instance_counter += 1
+        self._instance_id = IntercomTcpClient._instance_counter
+
         self.host = host
         self.port = port
         self._on_audio = on_audio
@@ -47,36 +53,28 @@ class IntercomTcpClient:
         self._streaming = False
         self._receive_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
-        self._lock = asyncio.Lock()
 
-    @property
-    def connected(self) -> bool:
-        """Return connection status."""
-        return self._connected
+        self._audio_sent = 0
+        self._audio_recv = 0
+        self._disconnect_notified = False
 
-    @property
-    def streaming(self) -> bool:
-        """Return streaming status."""
-        return self._streaming
+        _LOGGER.debug("[TCP#%d] Created for %s:%d", self._instance_id, host, port)
 
     async def connect(self) -> bool:
-        """Connect to the ESP device."""
         if self._connected:
             return True
 
         try:
-            _LOGGER.debug("Connecting to %s:%d", self.host, self.port)
+            _LOGGER.debug("[TCP#%d] Connecting to %s:%d...", self._instance_id, self.host, self.port)
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
                 timeout=CONNECT_TIMEOUT,
             )
             self._connected = True
-            _LOGGER.info("Connected to %s:%d", self.host, self.port)
+            self._disconnect_notified = False
+            _LOGGER.info("[TCP#%d] Connected", self._instance_id)
 
-            # Start receive task
             self._receive_task = asyncio.create_task(self._receive_loop())
-
-            # Start ping task
             self._ping_task = asyncio.create_task(self._ping_loop())
 
             if self._on_connected:
@@ -85,161 +83,183 @@ class IntercomTcpClient:
             return True
 
         except asyncio.TimeoutError:
-            _LOGGER.error("Connection timeout to %s:%d", self.host, self.port)
+            _LOGGER.error("[TCP#%d] Connection timeout", self._instance_id)
             return False
         except OSError as err:
-            _LOGGER.error("Connection error to %s:%d: %s", self.host, self.port, err)
+            _LOGGER.error("[TCP#%d] Connection error: %s", self._instance_id, err)
             return False
 
     async def disconnect(self) -> None:
-        """Disconnect from the ESP device."""
-        if not self._connected:
-            return
+        _LOGGER.info("[TCP#%d] Disconnecting...", self._instance_id)
 
-        _LOGGER.debug("Disconnecting from %s:%d", self.host, self.port)
+        self._connected = False
+        self._streaming = False
 
-        # Cancel tasks
         if self._receive_task:
             self._receive_task.cancel()
             try:
-                await self._receive_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._receive_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self._receive_task = None
 
         if self._ping_task:
             self._ping_task.cancel()
             try:
-                await self._ping_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._ping_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self._ping_task = None
 
-        # Close connection
         if self._writer:
             try:
                 self._writer.close()
-                await self._writer.wait_closed()
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=1.0)
             except Exception:
                 pass
             self._writer = None
             self._reader = None
 
-        self._connected = False
-        self._streaming = False
-
-        if self._on_disconnected:
+        if not self._disconnect_notified and self._on_disconnected:
+            self._disconnect_notified = True
             self._on_disconnected()
 
-        _LOGGER.info("Disconnected from %s:%d", self.host, self.port)
+        _LOGGER.info("[TCP#%d] Disconnected (sent=%d recv=%d)",
+                     self._instance_id, self._audio_sent, self._audio_recv)
 
     async def start_stream(self) -> bool:
-        """Start audio streaming."""
+        _LOGGER.info("[TCP#%d] start_stream()", self._instance_id)
+
         if not self._connected:
             if not await self.connect():
                 return False
 
-        async with self._lock:
-            if await self._send_message(MSG_START):
-                self._streaming = True
-                return True
-            return False
+        if await self._send_message(MSG_START):
+            self._streaming = True
+            _LOGGER.info("[TCP#%d] Stream started", self._instance_id)
+            return True
+        return False
 
     async def stop_stream(self) -> None:
-        """Stop audio streaming."""
-        if self._streaming:
-            async with self._lock:
-                await self._send_message(MSG_STOP)
-                self._streaming = False
+        _LOGGER.info("[TCP#%d] stop_stream()", self._instance_id)
+
+        # First stop accepting new audio
+        self._streaming = False
+
+        # Try to send STOP but don't block forever
+        if self._connected and self._writer:
+            try:
+                await asyncio.wait_for(self._send_message(MSG_STOP), timeout=1.0)
+                _LOGGER.debug("[TCP#%d] STOP sent", self._instance_id)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("[TCP#%d] STOP timeout", self._instance_id)
+            except Exception as err:
+                _LOGGER.debug("[TCP#%d] STOP error: %s", self._instance_id, err)
 
     async def send_audio(self, data: bytes) -> bool:
-        """Send audio data to ESP."""
+        """Send audio data with drain to ensure data is actually sent."""
         if not self._connected or not self._streaming:
             return False
 
-        async with self._lock:
-            return await self._send_message(MSG_AUDIO, data)
+        self._audio_sent += 1
+        if self._audio_sent <= 5 or self._audio_sent % 100 == 0:
+            _LOGGER.debug("[TCP#%d] send_audio #%d: %d bytes",
+                         self._instance_id, self._audio_sent, len(data))
 
-    async def _send_message(
-        self, msg_type: int, data: bytes = b"", flags: int = FLAG_NONE
-    ) -> bool:
-        """Send a protocol message."""
         if not self._writer:
             return False
 
         try:
-            # Build header: type (1) + flags (1) + length (2 LE)
+            header = struct.pack("<BBH", MSG_AUDIO, FLAG_NONE, len(data))
+            self._writer.write(header + data)
+            # Drain every packet to ensure data is sent - use short timeout to not block event loop
+            await asyncio.wait_for(self._writer.drain(), timeout=0.1)
+            return True
+        except asyncio.TimeoutError:
+            # Drain timeout - TCP congestion, skip this packet
+            if self._audio_sent % 50 == 0:
+                _LOGGER.warning("[TCP#%d] Drain timeout at #%d", self._instance_id, self._audio_sent)
+            return False
+        except Exception as err:
+            _LOGGER.error("[TCP#%d] Audio send error: %s", self._instance_id, err)
+            return False
+
+    async def _send_message(self, msg_type: int, data: bytes = b"", flags: int = FLAG_NONE) -> bool:
+        """Send control message with drain (blocking)."""
+        if not self._writer:
+            return False
+
+        try:
             header = struct.pack("<BBH", msg_type, flags, len(data))
             self._writer.write(header + data)
             await self._writer.drain()
             return True
         except Exception as err:
-            _LOGGER.error("Send error: %s", err)
-            await self.disconnect()
+            _LOGGER.error("[TCP#%d] Send error: %s", self._instance_id, err)
             return False
 
     async def _receive_loop(self) -> None:
-        """Receive messages from ESP."""
+        _LOGGER.debug("[TCP#%d] Receive loop started", self._instance_id)
         try:
             while self._connected and self._reader:
-                # Read header
                 header_data = await self._reader.readexactly(HEADER_SIZE)
                 msg_type, flags, length = struct.unpack("<BBH", header_data)
 
-                # Read payload
                 payload = b""
                 if length > 0:
+                    if length > MAX_PAYLOAD_SIZE:
+                        # Protocol desync - cannot recover, must disconnect
+                        _LOGGER.error("[TCP#%d] Protocol desync: bad length %d (max %d), closing",
+                                     self._instance_id, length, MAX_PAYLOAD_SIZE)
+                        raise ConnectionError("protocol desync")
                     payload = await self._reader.readexactly(length)
 
-                # Handle message
                 await self._handle_message(msg_type, flags, payload)
 
         except asyncio.IncompleteReadError:
-            _LOGGER.debug("Connection closed by peer")
+            _LOGGER.info("[TCP#%d] Connection closed by peer", self._instance_id)
         except asyncio.CancelledError:
-            raise
+            _LOGGER.debug("[TCP#%d] Receive loop cancelled", self._instance_id)
+        except ConnectionError as err:
+            _LOGGER.error("[TCP#%d] Connection error: %s", self._instance_id, err)
         except Exception as err:
-            _LOGGER.error("Receive error: %s", err)
+            _LOGGER.error("[TCP#%d] Receive error: %s", self._instance_id, err)
         finally:
-            if self._connected:
-                await self.disconnect()
+            # Mark as disconnected so other parts know the connection is dead
+            self._connected = False
+            self._streaming = False
+            if not self._disconnect_notified and self._on_disconnected:
+                self._disconnect_notified = True
+                self._on_disconnected()
 
-    async def _handle_message(
-        self, msg_type: int, flags: int, payload: bytes
-    ) -> None:
-        """Handle received message."""
+    async def _handle_message(self, msg_type: int, flags: int, payload: bytes) -> None:
         if msg_type == MSG_AUDIO:
+            self._audio_recv += 1
+            if self._audio_recv <= 5 or self._audio_recv % 100 == 0:
+                _LOGGER.debug("[TCP#%d] Audio recv #%d: %d bytes",
+                             self._instance_id, self._audio_recv, len(payload))
             if self._on_audio:
                 self._on_audio(payload)
 
         elif msg_type == MSG_PONG:
-            _LOGGER.debug("Received PONG")
+            _LOGGER.debug("[TCP#%d] PONG", self._instance_id)
 
         elif msg_type == MSG_STOP:
-            _LOGGER.info("Received STOP from ESP")
+            _LOGGER.info("[TCP#%d] STOP from ESP", self._instance_id)
             self._streaming = False
 
-        elif msg_type == MSG_ERROR:
-            if payload:
-                _LOGGER.error("Received ERROR: %d", payload[0])
-            else:
-                _LOGGER.error("Received ERROR")
-
         elif msg_type == MSG_PING:
+            _LOGGER.debug("[TCP#%d] PING -> PONG", self._instance_id)
             await self._send_message(MSG_PONG)
 
-        else:
-            _LOGGER.warning("Unknown message type: 0x%02X", msg_type)
+        elif msg_type == MSG_ERROR:
+            _LOGGER.error("[TCP#%d] ERROR from ESP", self._instance_id)
 
     async def _ping_loop(self) -> None:
-        """Send periodic pings."""
         try:
             while self._connected:
                 await asyncio.sleep(PING_INTERVAL)
                 if self._connected:
-                    async with self._lock:
-                        await self._send_message(MSG_PING)
+                    await self._send_message(MSG_PING)
         except asyncio.CancelledError:
-            raise
-        except Exception as err:
-            _LOGGER.error("Ping error: %s", err)
+            pass

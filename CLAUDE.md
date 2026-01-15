@@ -1,5 +1,20 @@
 # Claude Code Project Context - Intercom API
 
+## CRITICAL SETUP INFO - DO NOT FORGET
+
+- **HA External URL**: `https://514d1f563e4e1ad4.sn.mynetname.net`
+- **HA Token**: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlMTc5YzQ2ZmVkOGM0ZjU1OTQyOWRkNDg1OTI4ZDk2MiIsImlhdCI6MTc2ODQ5MTE3NywiZXhwIjoyMDgzODUxMTc3fQ.W6iHGkX1rLKNkmVjZgeTukWRUuBSqIupU2L1VYEOgWY`
+- **Test Card**: `/lovelace/test`
+- **Home Assistant**: `root@192.168.1.10` (LXC container, HA installed via pip)
+- **ESPHome**: venv in `/home/daniele/cc/claude/intercom-api/` on THIS PC
+- **ESP32 IP**: 192.168.1.18
+- **HA Config Path**: `/home/homeassistant/.homeassistant/`
+- **Deploy HA files**: `scp -r homeassistant/custom_components/intercom_native root@192.168.1.10:/home/homeassistant/.homeassistant/custom_components/`
+- **Deploy frontend**: `scp frontend/www/*.js root@192.168.1.10:/home/homeassistant/.homeassistant/www/`
+- **Restart HA**: `ssh root@192.168.1.10 'systemctl restart homeassistant'`
+- **HA Logs**: `ssh root@192.168.1.10 'journalctl -u homeassistant -f'`
+- **Compile & Upload ESP**: `source venv/bin/activate && esphome compile intercom-mini.yaml && esphome upload intercom-mini.yaml --device 192.168.1.18`
+
 ## Overview
 
 Sistema intercom bidirezionale full-duplex che usa TCP invece di UDP/WebRTC.
@@ -10,6 +25,30 @@ Sostituisce `esphome-intercom` (legacy UDP) con un approccio più robusto.
 - **Questo repo**: `/home/daniele/cc/claude/intercom-api/`
 - **Legacy (non sviluppare)**: `/home/daniele/cc/claude/esphome-intercom/`
 
+---
+
+## STATO ATTUALE (Milestone 2025-01-15)
+
+### Funziona
+- Full duplex Browser ↔ HA ↔ ESP stabile (testato 60+ secondi)
+- Audio ESP→Browser arriva (1000+ pacchetti)
+- Audio Browser→ESP arriva (200+ pacchetti)
+- Nessun crash/disconnect a 5 secondi (bug PING risolto)
+
+### Problemi da risolvere
+1. **Audio glitchy** - suona tipo "cc-ii-aa-oo" con pezzi mancanti (stuttering)
+2. **Latenza altissima** - 8-9 secondi tra cattura mic e riproduzione speaker ESP
+3. **Task RTOS non ottimizzati** - attualmente un solo task fa sia TX che RX
+
+### Fix applicati in questa sessione
+1. `send_mutex_` - Thread safety per tx_buffer_ (race condition PING vs AUDIO)
+2. No PING durante streaming - Evita interferenze
+3. Partial send handling - Gestisce TCP congestion
+4. Protocol desync fix HA - Chiude connessione invece di corrompere stream
+5. MAX_MESSAGE_SIZE aumentato - Browser manda chunk 2048 bytes
+
+---
+
 ## Architettura
 
 ```
@@ -17,13 +56,10 @@ Sostituisce `esphome-intercom` (legacy UDP) con un approccio più robusto.
 │   Browser   │◄──WS───►│     HA      │◄──TCP──►│    ESP32    │
 │             │         │             │  6054   │             │
 └─────────────┘         └─────────────┘         └─────────────┘
-                                                      │
-                                                 TCP 6054
-                                                      │
-                                                      ▼
-                                                ┌─────────────┐
-                                                │  ESP32 #2   │
-                                                └─────────────┘
+     │                        │                       │
+  AudioWorklet            tcp_client.py          FreeRTOS Tasks
+  16kHz mono              async TCP              server_task (Core 1)
+  2048B chunks            512B chunks            audio_task (Core 0)
 ```
 
 ## Componenti
@@ -32,18 +68,19 @@ Sostituisce `esphome-intercom` (legacy UDP) con un approccio più robusto.
 - **Porta**: TCP 6054 (audio streaming)
 - **Controllo**: via ESPHome API normale (6053) - switch, number entities
 - **Modalità**: Server (attende connessioni) + Client (per ESP→ESP)
-- **Coesiste con**: voice_assistant, intercom_audio legacy
+- **Task RTOS**:
+  - `server_task_` (Core 1, priority 5) - TCP accept, receive, control messages
+  - `audio_task_` (Core 0, priority 6) - mic→network TX, speaker buffer→speaker RX
 
 ### 2. HA Integration: `intercom_native`
-- **Discovery**: trova device con entity `switch.*_intercom_api`
-- **WebSocket API**: `intercom_native/start`, `intercom_native/stop`
-- **Binary handler**: per audio browser ↔ HA
-- **TCP client**: verso ESP porta 6054
+- **WebSocket API**: `intercom_native/start`, `intercom_native/stop`, `intercom_native/audio`
+- **TCP client**: Async verso ESP porta 6054
+- **Versione**: 4.1.0
 
 ### 3. Frontend: `intercom-card.js`
 - **Lovelace card** custom
-- **getUserMedia** + AudioWorklet
-- **WebSocket** binary streaming verso HA
+- **getUserMedia** + AudioWorklet (16kHz)
+- **WebSocket** JSON + base64 audio verso HA
 
 ---
 
@@ -68,13 +105,6 @@ Sostituisce `esphome-intercom` (legacy UDP) con un approccio più robusto.
 | 0x05 | PONG | Both | - |
 | 0x06 | ERROR | Server→Client | Error code (1 byte) |
 
-### Flags
-
-| Bit | Name | Description |
-|-----|------|-------------|
-| 0 | END | Last packet of stream |
-| 1-7 | Reserved | - |
-
 ### Audio Format
 
 | Parameter | Value |
@@ -82,28 +112,8 @@ Sostituisce `esphome-intercom` (legacy UDP) con un approccio più robusto.
 | Sample Rate | 16000 Hz |
 | Bit Depth | 16-bit signed PCM |
 | Channels | Mono |
-| Chunk Size | 512 bytes (256 samples = 16ms) |
-
-### Handshake
-
-```
-Client                          Server
-   │                               │
-   │──── TCP Connect ────────────►│
-   │                               │
-   │──── START ──────────────────►│
-   │                               │
-   │◄─── PONG (ack) ──────────────│
-   │                               │
-   │◄─── AUDIO ───────────────────│
-   │──── AUDIO ──────────────────►│
-   │         (full duplex)         │
-   │                               │
-   │──── STOP ───────────────────►│
-   │◄─── STOP ────────────────────│
-   │                               │
-   │──── TCP Close ──────────────►│
-```
+| ESP Chunk Size | 512 bytes (256 samples = 16ms) |
+| Browser Chunk Size | 2048 bytes (1024 samples = 64ms) |
 
 ---
 
@@ -115,7 +125,7 @@ intercom-api/
 │   └── components/
 │       └── intercom_api/
 │           ├── __init__.py           # ESPHome component config
-│           ├── intercom_api.h        # Header
+│           ├── intercom_api.h        # Header + class definition
 │           ├── intercom_api.cpp      # TCP server + audio handling
 │           ├── intercom_protocol.h   # Protocol constants
 │           ├── switch.py             # Switch entity
@@ -127,8 +137,8 @@ intercom-api/
 │           ├── __init__.py           # Integration setup
 │           ├── manifest.json         # HA manifest
 │           ├── config_flow.py        # Config UI
-│           ├── websocket_api.py      # WS commands + binary handler
-│           ├── tcp_client.py         # Async TCP client to ESP
+│           ├── websocket_api.py      # WS commands + session manager
+│           ├── tcp_client.py         # Async TCP client (v4.1.0)
 │           └── const.py              # Constants
 │
 ├── frontend/
@@ -136,6 +146,7 @@ intercom-api/
 │       ├── intercom-card.js          # Lovelace card
 │       └── intercom-processor.js     # AudioWorklet
 │
+├── intercom-mini.yaml                # ESP32-S3 config
 ├── CLAUDE.md                         # This file
 └── README.md                         # User documentation
 ```
@@ -145,59 +156,36 @@ intercom-api/
 ## Development
 
 ```bash
-# No venv needed for this repo (pure components)
+# Compile e upload ESP
+source venv/bin/activate
+esphome compile intercom-mini.yaml
+esphome upload intercom-mini.yaml --device 192.168.1.18
 
-# Test ESPHome component: copy to esphome-intercom and compile
-cp -r esphome/components/intercom_api /home/daniele/cc/claude/esphome-intercom/components/
+# Deploy HA integration
+scp -r homeassistant/custom_components/intercom_native root@192.168.1.10:/home/homeassistant/.homeassistant/custom_components/
+ssh root@192.168.1.10 'systemctl restart homeassistant'
 
-# Test HA integration: symlink to HA config
-ln -s /home/daniele/cc/claude/intercom-api/homeassistant/custom_components/intercom_native \
-      ~/.homeassistant/custom_components/intercom_native
+# Monitor logs
+ssh root@192.168.1.10 'journalctl -u homeassistant -f'
 ```
 
 ---
 
-## Dipendenze da esphome-intercom
+## TODO - Prossimi step
 
-Questi componenti del repo legacy possono essere riutilizzati:
+### Priorità Alta (Latenza)
+- [ ] Separare task RTOS: `tx_task` (Core 0) + `rx_task` (Core 1)
+- [ ] Ridurre buffer sizes per minimizzare latenza
+- [ ] Analizzare dove si accumula il delay (8-9s inaccettabile, target <500ms)
 
-| Component | Uso |
-|-----------|-----|
-| `i2s_audio_duplex` | Full-duplex su singolo bus I2S (ES8311) |
-| `esp_aec` | Echo cancellation |
-| `mdns_discovery` | Discovery peers (opzionale per ESP→ESP) |
+### Priorità Media (Audio Quality)
+- [ ] Fix audio glitchy (stuttering) - probabilmente buffer underrun
+- [ ] Verificare sample rate mismatch browser (48kHz) vs ESP (16kHz)
+- [ ] Ottimizzare chunk sizes
 
----
-
-## Roadmap
-
-### Fase 1: Protocollo ✅
-- [x] Definito protocollo TCP binario
-
-### Fase 2: ESPHome Component
-- [ ] `intercom_protocol.h` - costanti protocollo
-- [ ] `intercom_api.h/cpp` - TCP server, audio handling
-- [ ] `__init__.py` - config validation
-- [ ] `switch.py` - on/off streaming
-- [ ] `number.py` - volume control
-- [ ] Test compilazione
-- [ ] Test connessione TCP
-
-### Fase 3: HA Integration
-- [ ] `manifest.json`
-- [ ] `__init__.py` - setup, discovery
-- [ ] `tcp_client.py` - async TCP verso ESP
-- [ ] `websocket_api.py` - binary handler browser
-- [ ] Test browser → HA → ESP
-
-### Fase 4: Lovelace Card
-- [ ] `intercom-card.js` - UI
-- [ ] `intercom-processor.js` - AudioWorklet
-- [ ] Test Chrome, Safari, Firefox
-
-### Fase 5: ESP → ESP
-- [ ] Client mode in intercom_api
-- [ ] Test chiamata diretta tra due ESP
+### Priorità Bassa
+- [ ] ESP→ESP direct mode
+- [ ] Echo cancellation (AEC)
 
 ---
 
@@ -212,14 +200,16 @@ Questi componenti del repo legacy possono essere riutilizzati:
 | Richiede port forwarding | Nessuna config rete |
 | go2rtc/WebRTC complesso | Protocollo semplice |
 
-### Coesistenza con voice_assistant
+### Voice Assistant Reference
 
-- `intercom_api` usa porta 6054
-- `voice_assistant` usa porta 6053 (API nativa)
-- Zero conflitti, possono coesistere
+ESPHome Voice Assistant usa architettura simile con:
+- Ring buffers FreeRTOS per decoupling
+- Task separati per mic e speaker
+- Counting semaphores per reference counting
+- Event groups per comunicazione task→main loop
 
 ### Latenza Target
 
 - Chunk size: 512 bytes = 16ms di audio
-- Round-trip target: < 200ms
+- Round-trip target: < 500ms (attualmente 8-9s!)
 - Buffer playback: 2-3 chunks = 32-48ms

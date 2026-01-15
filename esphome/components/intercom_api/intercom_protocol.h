@@ -52,7 +52,8 @@ struct __attribute__((packed)) MessageHeader {
 };
 
 static constexpr size_t HEADER_SIZE = sizeof(MessageHeader);
-static constexpr size_t MAX_MESSAGE_SIZE = HEADER_SIZE + AUDIO_CHUNK_SIZE + 64;  // Some margin
+static constexpr size_t MAX_AUDIO_CHUNK = 2048;  // Browser may send larger chunks
+static constexpr size_t MAX_MESSAGE_SIZE = HEADER_SIZE + MAX_AUDIO_CHUNK + 64;
 
 // Buffer sizes
 static constexpr size_t RX_BUFFER_SIZE = 8192;       // ~256ms of audio

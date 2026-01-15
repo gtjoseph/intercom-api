@@ -1,8 +1,10 @@
 """WebSocket API for Intercom Native integration."""
+# VERSION: 4.0.3 - Enhanced debug logging
 
 import asyncio
+import base64
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import voluptuous as vol
 
@@ -11,14 +13,17 @@ from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     DOMAIN,
-    WS_TYPE_START,
-    WS_TYPE_STOP,
-    WS_TYPE_LIST,
     INTERCOM_PORT,
 )
 from .tcp_client import IntercomTcpClient
 
 _LOGGER = logging.getLogger(__name__)
+
+# WebSocket command types
+WS_TYPE_START = f"{DOMAIN}/start"
+WS_TYPE_STOP = f"{DOMAIN}/stop"
+WS_TYPE_AUDIO = f"{DOMAIN}/audio"
+WS_TYPE_LIST = f"{DOMAIN}/list_devices"
 
 # Active sessions: device_id -> IntercomSession
 _sessions: Dict[str, "IntercomSession"] = {}
@@ -30,45 +35,67 @@ class IntercomSession:
     def __init__(
         self,
         hass: HomeAssistant,
-        connection: websocket_api.ActiveConnection,
         device_id: str,
         host: str,
-        binary_handler_id: int,
     ):
         """Initialize session."""
         self.hass = hass
-        self.connection = connection
         self.device_id = device_id
         self.host = host
-        self.binary_handler_id = binary_handler_id
 
         self._tcp_client: Optional[IntercomTcpClient] = None
         self._active = False
+        self._audio_sent_count = 0
+        self._audio_recv_count = 0
+
+        _LOGGER.debug("[Session %s] Created for host %s", device_id, host)
 
     async def start(self) -> bool:
         """Start the intercom session."""
+        _LOGGER.info("[Session %s] Starting... host=%s", self.device_id, self.host)
+
         if self._active:
+            _LOGGER.warning("[Session %s] Already active!", self.device_id)
             return True
 
+        session = self
+
         def on_audio(data: bytes) -> None:
-            """Handle audio from ESP."""
-            if self._active:
-                # Send to browser via binary handler
-                self.connection.send_message(
-                    websocket_api.messages.binary_message(
-                        self.binary_handler_id, data
-                    )
+            """Handle audio from ESP - fire event to browser."""
+            session._audio_recv_count += 1
+
+            # Log EVERY 50 packets to track flow
+            if session._audio_recv_count <= 5 or session._audio_recv_count % 50 == 0:
+                _LOGGER.warning(
+                    "[Session %s] ESP->Browser #%d: %d bytes, active=%s",
+                    session.device_id, session._audio_recv_count, len(data), session._active
                 )
 
+            if not session._active:
+                _LOGGER.warning("[Session %s] Dropping audio #%d - session not active!",
+                               session.device_id, session._audio_recv_count)
+                return
+
+            try:
+                session.hass.bus.async_fire(
+                    "intercom_audio",
+                    {
+                        "device_id": session.device_id,
+                        "audio": base64.b64encode(data).decode("ascii"),
+                    }
+                )
+            except Exception as err:
+                _LOGGER.error("[Session %s] Error firing event #%d: %s",
+                             session.device_id, session._audio_recv_count, err)
+
         def on_connected() -> None:
-            """Handle connection established."""
-            _LOGGER.info("Intercom connected to %s", self.host)
+            _LOGGER.info("[Session %s] TCP connected to %s", session.device_id, session.host)
 
         def on_disconnected() -> None:
-            """Handle disconnection."""
-            _LOGGER.info("Intercom disconnected from %s", self.host)
-            self._active = False
+            _LOGGER.info("[Session %s] TCP disconnected", session.device_id)
+            session._active = False
 
+        _LOGGER.info("[Session %s] Creating TCP client...", self.device_id)
         self._tcp_client = IntercomTcpClient(
             host=self.host,
             port=INTERCOM_PORT,
@@ -77,20 +104,27 @@ class IntercomSession:
             on_disconnected=on_disconnected,
         )
 
+        _LOGGER.info("[Session %s] Calling connect()...", self.device_id)
         if await self._tcp_client.connect():
+            _LOGGER.info("[Session %s] Connect OK, calling start_stream()...", self.device_id)
             if await self._tcp_client.start_stream():
                 self._active = True
+                _LOGGER.info("[Session %s] Started successfully!", self.device_id)
                 return True
             else:
+                _LOGGER.error("[Session %s] Failed to start stream", self.device_id)
                 await self._tcp_client.disconnect()
+        else:
+            _LOGGER.error("[Session %s] Failed to connect TCP", self.device_id)
 
         return False
 
     async def stop(self) -> None:
         """Stop the intercom session."""
-        if not self._active:
-            return
-
+        _LOGGER.info(
+            "[Session %s] Stopping... sent=%d recv=%d",
+            self.device_id, self._audio_sent_count, self._audio_recv_count
+        )
         self._active = False
 
         if self._tcp_client:
@@ -99,15 +133,27 @@ class IntercomSession:
             self._tcp_client = None
 
     async def handle_audio(self, data: bytes) -> None:
-        """Handle audio from browser."""
+        """Handle audio from browser (base64 decoded)."""
+        self._audio_sent_count += 1
+        if self._audio_sent_count <= 5 or self._audio_sent_count % 100 == 0:
+            _LOGGER.info(
+                "[Session %s] Browser->ESP audio #%d: %d bytes, active=%s, tcp=%s",
+                self.device_id, self._audio_sent_count, len(data),
+                self._active, self._tcp_client is not None
+            )
+
         if self._active and self._tcp_client:
-            await self._tcp_client.send_audio(data)
+            result = await self._tcp_client.send_audio(data)
+            if self._audio_sent_count <= 5:
+                _LOGGER.info("[Session %s] send_audio result: %s", self.device_id, result)
 
 
 def async_register_websocket_api(hass: HomeAssistant) -> None:
     """Register WebSocket API commands."""
+    _LOGGER.info("Registering Intercom Native WebSocket API v4.0.0 (JSON audio)")
     websocket_api.async_register_command(hass, websocket_start)
     websocket_api.async_register_command(hass, websocket_stop)
+    websocket_api.async_register_command(hass, websocket_audio)
     websocket_api.async_register_command(hass, websocket_list_devices)
 
 
@@ -127,48 +173,35 @@ async def websocket_start(
     """Start intercom session."""
     device_id = msg["device_id"]
     host = msg["host"]
+    msg_id = msg["id"]
 
-    _LOGGER.info("Starting intercom session for device %s at %s", device_id, host)
+    _LOGGER.info("=== START REQUEST === device=%s host=%s msg_id=%s", device_id, host, msg_id)
 
-    # Check if session already exists
-    if device_id in _sessions:
-        connection.send_error(
-            msg["id"], "already_active", f"Session already active for {device_id}"
-        )
-        return
+    try:
+        # Stop existing session if any
+        if device_id in _sessions:
+            _LOGGER.info("Stopping existing session for %s", device_id)
+            old_session = _sessions.pop(device_id)
+            await old_session.stop()
+            _LOGGER.info("Old session stopped")
 
-    # Register binary handler for audio from browser
-    def handle_binary(data: bytes) -> None:
-        """Handle binary audio data from browser."""
-        session = _sessions.get(device_id)
-        if session:
-            asyncio.create_task(session.handle_audio(data))
+        # Create new session
+        _LOGGER.info("Creating new session...")
+        session = IntercomSession(hass=hass, device_id=device_id, host=host)
 
-    binary_handler_id = connection.async_register_binary_handler(handle_binary)
-
-    # Create and start session
-    session = IntercomSession(
-        hass=hass,
-        connection=connection,
-        device_id=device_id,
-        host=host,
-        binary_handler_id=binary_handler_id,
-    )
-
-    if await session.start():
-        _sessions[device_id] = session
-        connection.send_result(
-            msg["id"],
-            {
-                "success": True,
-                "binary_handler_id": binary_handler_id,
-            },
-        )
-    else:
-        connection.async_unregister_binary_handler(binary_handler_id)
-        connection.send_error(
-            msg["id"], "connection_failed", f"Failed to connect to {host}"
-        )
+        _LOGGER.info("Calling session.start()...")
+        if await session.start():
+            _sessions[device_id] = session
+            _LOGGER.info("=== SESSION STARTED === device=%s - sending result", device_id)
+            connection.send_result(msg_id, {"success": True})
+            _LOGGER.info("Result sent to browser")
+        else:
+            _LOGGER.error("=== SESSION FAILED === device=%s - sending error", device_id)
+            connection.send_error(msg_id, "connection_failed", f"Failed to connect to {host}")
+            _LOGGER.info("Error sent to browser")
+    except Exception as err:
+        _LOGGER.exception("=== EXCEPTION in websocket_start === %s", err)
+        connection.send_error(msg_id, "exception", str(err))
 
 
 @websocket_api.websocket_command(
@@ -185,19 +218,51 @@ async def websocket_stop(
 ) -> None:
     """Stop intercom session."""
     device_id = msg["device_id"]
+    msg_id = msg["id"]
 
-    _LOGGER.info("Stopping intercom session for device %s", device_id)
+    _LOGGER.info("=== STOP === device=%s", device_id)
 
     session = _sessions.pop(device_id, None)
     if session:
-        # Unregister binary handler
-        connection.async_unregister_binary_handler(session.binary_handler_id)
         await session.stop()
-        connection.send_result(msg["id"], {"success": True})
+        _LOGGER.info("Session stopped for %s", device_id)
     else:
-        connection.send_error(
-            msg["id"], "not_found", f"No active session for {device_id}"
-        )
+        _LOGGER.warning("No session found for %s", device_id)
+
+    connection.send_result(msg_id, {"success": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_AUDIO,
+        vol.Required("device_id"): str,
+        vol.Required("audio"): str,  # base64 encoded audio
+    }
+)
+@callback
+def websocket_audio(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: Dict[str, Any],
+) -> None:
+    """Handle audio from browser (JSON with base64) - non-blocking."""
+    device_id = msg["device_id"]
+    audio_b64 = msg["audio"]
+
+    session = _sessions.get(device_id)
+    if not session:
+        _LOGGER.warning("[Audio] No session for device %s", device_id)
+        return
+    if not session._active:
+        _LOGGER.warning("[Audio] Session not active for device %s", device_id)
+        return
+
+    try:
+        audio_data = base64.b64decode(audio_b64)
+        # Fire and forget - don't block
+        hass.async_create_task(session.handle_audio(audio_data))
+    except Exception as err:
+        _LOGGER.error("Error decoding audio: %s", err)
 
 
 @websocket_api.websocket_command(
@@ -211,21 +276,18 @@ def websocket_list_devices(
     connection: websocket_api.ActiveConnection,
     msg: Dict[str, Any],
 ) -> None:
-    """List devices with intercom_api capability."""
-    # Find ESPHome devices with intercom_api switch
-    devices = []
+    """List devices with intercom capability."""
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import device_registry as dr
 
-    # Get all entities and find intercom_api switches
-    entity_registry = hass.helpers.entity_registry.async_get(hass)
-    device_registry = hass.helpers.device_registry.async_get(hass)
+    devices = []
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
 
     for entity in entity_registry.entities.values():
-        # Look for switch entities that match intercom_api pattern
-        if entity.domain == "switch" and "intercom_api" in entity.entity_id:
+        if entity.domain == "switch" and entity.entity_id.endswith("_intercom"):
             device = device_registry.async_get(entity.device_id)
             if device:
-                # Get device IP from ESPHome
-                # This is simplified - in practice we'd need to query ESPHome
                 devices.append(
                     {
                         "device_id": entity.device_id,

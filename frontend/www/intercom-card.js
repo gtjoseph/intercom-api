@@ -1,36 +1,44 @@
 /**
  * Intercom Card - Lovelace custom card for intercom_native integration
- *
- * Provides bidirectional audio streaming between browser and ESP32
- * via Home Assistant WebSocket API.
+ * VERSION: 4.2.0 - Larger chunks (64ms), 16kHz AudioContext, faster base64
  */
 
-class IntercomCard extends HTMLElement {
-  static get properties() {
-    return {
-      hass: {},
-      config: {},
-    };
-  }
+const INTERCOM_CARD_VERSION = "4.2.0";
 
+class IntercomCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
     this._active = false;
-    this._binaryHandlerId = null;
+    this._stopping = false;
+    this._starting = false;
+
+    // Audio recording
     this._audioContext = null;
     this._mediaStream = null;
     this._workletNode = null;
+    this._source = null;
+
+    // Audio playback
+    this._playbackContext = null;
     this._gainNode = null;
+    this._audioQueue = [];
+    this._isPlaying = false;
+    this._volume = 80;
+
+    // Event subscription
+    this._unsubscribe = null;
+
+    // Stats
+    this._chunksSent = 0;
+    this._chunksReceived = 0;
+
+    console.log(`[IntercomCard] v${INTERCOM_CARD_VERSION} loaded`);
   }
 
   setConfig(config) {
-    if (!config.device_id) {
-      throw new Error("You need to define a device_id");
-    }
-    if (!config.host) {
-      throw new Error("You need to define a host (ESP IP address)");
-    }
+    if (!config.device_id) throw new Error("device_id required");
+    if (!config.host) throw new Error("host required");
     this.config = config;
     this._render();
   }
@@ -41,12 +49,15 @@ class IntercomCard extends HTMLElement {
 
   _render() {
     const name = this.config.name || "Intercom";
+    const statusText = this._starting ? "Starting..." :
+                       this._stopping ? "Stopping..." :
+                       this._active ? "Streaming" : "Ready";
+    const statusClass = this._starting || this._stopping ? "transitioning" :
+                        this._active ? "connected" : "disconnected";
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host {
-          display: block;
-        }
+        :host { display: block; }
         .card {
           background: var(--ha-card-background, var(--card-background-color, white));
           border-radius: var(--ha-card-border-radius, 12px);
@@ -81,49 +92,20 @@ class IntercomCard extends HTMLElement {
           background: var(--primary-color, #03a9f4);
           color: white;
         }
-        .intercom-button.off:hover {
-          background: var(--primary-color-light, #4fc3f7);
-          transform: scale(1.05);
-        }
         .intercom-button.on {
           background: #f44336;
           color: white;
           animation: pulse 1.5s infinite;
         }
-        .intercom-button.on:hover {
-          background: #d32f2f;
+        .intercom-button:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+          animation: none;
         }
         @keyframes pulse {
           0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.4); }
           70% { box-shadow: 0 0 0 15px rgba(244, 67, 54, 0); }
           100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); }
-        }
-        .volume-container {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          margin-bottom: 12px;
-        }
-        .volume-label {
-          color: var(--secondary-text-color);
-          font-size: 0.9em;
-          min-width: 60px;
-        }
-        .volume-slider {
-          flex: 1;
-          -webkit-appearance: none;
-          height: 6px;
-          border-radius: 3px;
-          background: var(--divider-color, #e0e0e0);
-          outline: none;
-        }
-        .volume-slider::-webkit-slider-thumb {
-          -webkit-appearance: none;
-          width: 18px;
-          height: 18px;
-          border-radius: 50%;
-          background: var(--primary-color, #03a9f4);
-          cursor: pointer;
         }
         .status {
           text-align: center;
@@ -137,11 +119,33 @@ class IntercomCard extends HTMLElement {
           border-radius: 50%;
           margin-right: 6px;
         }
-        .status-indicator.connected {
-          background: #4caf50;
+        .status-indicator.connected { background: #4caf50; }
+        .status-indicator.disconnected { background: #9e9e9e; }
+        .status-indicator.transitioning {
+          background: #ff9800;
+          animation: blink 0.5s infinite;
         }
-        .status-indicator.disconnected {
-          background: #9e9e9e;
+        @keyframes blink {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.3; }
+        }
+        .stats {
+          font-size: 0.75em;
+          color: #666;
+          margin-top: 8px;
+          text-align: center;
+        }
+        .volume-control {
+          margin-top: 12px;
+          text-align: center;
+        }
+        .volume-control label {
+          font-size: 0.85em;
+          color: var(--primary-text-color);
+        }
+        .volume-control input[type="range"] {
+          width: 100%;
+          margin-top: 4px;
         }
         .error {
           color: #f44336;
@@ -149,33 +153,68 @@ class IntercomCard extends HTMLElement {
           text-align: center;
           margin-top: 8px;
         }
+        .debug {
+          font-size: 0.6em;
+          color: #999;
+          margin-top: 8px;
+          font-family: monospace;
+          max-height: 100px;
+          overflow-y: auto;
+        }
       </style>
       <div class="card">
-        <div class="header">${name}</div>
+        <div class="header">${name} <span style="font-size:0.5em;color:#999;">v${INTERCOM_CARD_VERSION}</span></div>
         <div class="button-container">
-          <button class="intercom-button ${this._active ? "on" : "off"}" id="toggleBtn">
-            ${this._active ? "STOP" : "START"}
+          <button class="intercom-button ${this._active ? "on" : "off"}" id="btn"
+                  ${this._starting || this._stopping ? "disabled" : ""}>
+            ${this._stopping ? "..." : this._active ? "STOP" : "START"}
           </button>
         </div>
-        <div class="volume-container">
-          <span class="volume-label">Volume</span>
-          <input type="range" class="volume-slider" id="volumeSlider"
-                 min="0" max="100" value="${this.config.volume || 80}">
-        </div>
         <div class="status">
-          <span class="status-indicator ${this._active ? "connected" : "disconnected"}"></span>
-          ${this._active ? "Streaming" : "Ready"}
+          <span class="status-indicator ${statusClass}"></span>
+          ${statusText}
         </div>
-        <div class="error" id="errorMsg"></div>
+        <div class="stats" id="stats">Sent: 0 | Recv: 0</div>
+        <div class="volume-control">
+          <label>Volume: <span id="volVal">${this._volume}</span>%</label>
+          <input type="range" id="vol" min="0" max="100" value="${this._volume}">
+        </div>
+        <div class="error" id="err"></div>
+        <div class="debug" id="dbg"></div>
       </div>
     `;
 
-    // Bind events
-    this.shadowRoot.getElementById("toggleBtn").addEventListener("click", () => this._toggle());
-    this.shadowRoot.getElementById("volumeSlider").addEventListener("input", (e) => this._setVolume(e.target.value));
+    this.shadowRoot.getElementById("btn").onclick = () => this._toggle();
+    this.shadowRoot.getElementById("vol").oninput = (e) => {
+      this._volume = parseInt(e.target.value);
+      this.shadowRoot.getElementById("volVal").textContent = this._volume;
+      if (this._gainNode) {
+        this._gainNode.gain.value = this._volume / 100;
+      }
+    };
+  }
+
+  _log(msg) {
+    console.log("[Intercom]", msg);
+    const el = this.shadowRoot?.getElementById("dbg");
+    if (el) {
+      const time = new Date().toLocaleTimeString();
+      el.innerHTML = `[${time}] ${msg}<br>` + el.innerHTML.split("<br>").slice(0, 15).join("<br>");
+    }
+  }
+
+  _updateStats() {
+    const el = this.shadowRoot?.getElementById("stats");
+    if (el) el.textContent = `Sent: ${this._chunksSent} | Recv: ${this._chunksReceived}`;
+  }
+
+  _showError(msg) {
+    const el = this.shadowRoot?.getElementById("err");
+    if (el) el.textContent = msg;
   }
 
   async _toggle() {
+    if (this._starting || this._stopping) return;
     if (this._active) {
       await this._stop();
     } else {
@@ -184,179 +223,241 @@ class IntercomCard extends HTMLElement {
   }
 
   async _start() {
+    this._starting = true;
+    this._render();
+    this._log("Starting...");
+    this._showError("");
+    this._chunksSent = 0;
+    this._chunksReceived = 0;
+
     try {
-      this._showError("");
-
-      // Request microphone permission (requires HTTPS or localhost)
+      // 1. Microphone
+      this._log("Getting microphone...");
       this._mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
+      this._log("Mic OK: " + this._mediaStream.getAudioTracks()[0].label);
 
-      // Create AudioContext
-      this._audioContext = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 16000,
-      });
+      // 2. Audio context - force 16kHz if possible
+      this._audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      if (this._audioContext.state === "suspended") await this._audioContext.resume();
+      this._log(`AudioContext: ${this._audioContext.sampleRate}Hz (requested 16000)`);
 
-      // Load AudioWorklet processor
-      await this._audioContext.audioWorklet.addModule(
-        "/local/intercom-processor.js"
-      );
-
-      // Create nodes
-      const source = this._audioContext.createMediaStreamSource(this._mediaStream);
+      // 3. Worklet
+      await this._audioContext.audioWorklet.addModule(`/local/intercom-processor.js?v=${INTERCOM_CARD_VERSION}`);
+      this._source = this._audioContext.createMediaStreamSource(this._mediaStream);
       this._workletNode = new AudioWorkletNode(this._audioContext, "intercom-processor");
-      this._gainNode = this._audioContext.createGain();
 
-      // Connect: source -> worklet -> gain -> destination (for monitoring)
-      source.connect(this._workletNode);
-      this._workletNode.connect(this._gainNode);
-      // Don't connect to destination to avoid feedback
-
-      // Handle audio from worklet (to send to ESP)
-      this._workletNode.port.onmessage = (event) => {
-        if (event.data.type === "audio") {
-          this._sendAudio(event.data.buffer);
+      this._workletNode.port.onmessage = (e) => {
+        if (e.data.type === "audio") {
+          this._sendAudio(new Int16Array(e.data.buffer));
         }
       };
 
-      // Start WebSocket session
+      this._source.connect(this._workletNode);
+      this._log("Audio pipeline ready");
+
+      // 4. Playback context
+      this._playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+      this._gainNode = this._playbackContext.createGain();
+      this._gainNode.gain.value = this._volume / 100;
+      this._gainNode.connect(this._playbackContext.destination);
+
+      // 5. Start HA session
+      this._log("Starting HA session...");
       const result = await this._hass.connection.sendMessagePromise({
         type: "intercom_native/start",
         device_id: this.config.device_id,
         host: this.config.host,
       });
 
-      if (result.success) {
-        this._binaryHandlerId = result.binary_handler_id;
+      if (!result.success) throw new Error("Start failed");
+      this._log("Session started");
 
-        // Subscribe to binary messages (audio from ESP)
-        this._hass.connection.socket.addEventListener("message", this._handleBinaryMessage.bind(this));
+      // 6. Subscribe to ESP audio events
+      this._unsubscribe = await this._hass.connection.subscribeEvents(
+        (e) => this._handleAudioEvent(e),
+        "intercom_audio"
+      );
 
-        this._active = true;
-        this._render();
-      } else {
-        throw new Error("Failed to start intercom session");
-      }
+      this._active = true;
+      this._starting = false;
+      this._render();
+      this._log("=== STREAMING ===");
+
     } catch (err) {
-      console.error("Intercom start error:", err);
-      this._showError(err.message);
+      console.error("[Intercom] Start error:", err);
+      this._showError(err.message || String(err));
+      this._log("ERROR: " + err.message);
       await this._cleanup();
+      this._starting = false;
+      this._render();
     }
   }
 
   async _stop() {
+    this._stopping = true;
+    this._render();
+    this._log("Stopping...");
+
     try {
-      // Stop WebSocket session
       await this._hass.connection.sendMessagePromise({
         type: "intercom_native/stop",
         device_id: this.config.device_id,
       });
     } catch (err) {
-      console.error("Intercom stop error:", err);
+      this._log("Stop error: " + err.message);
     }
 
     await this._cleanup();
     this._active = false;
+    this._stopping = false;
     this._render();
+    this._log("=== STOPPED ===");
   }
 
   async _cleanup() {
-    // Stop media stream
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe = null;
+    }
     if (this._mediaStream) {
-      this._mediaStream.getTracks().forEach((track) => track.stop());
+      this._mediaStream.getTracks().forEach(t => t.stop());
       this._mediaStream = null;
     }
-
-    // Close AudioContext
+    if (this._workletNode) {
+      this._workletNode.disconnect();
+      this._workletNode = null;
+    }
+    if (this._source) {
+      this._source.disconnect();
+      this._source = null;
+    }
     if (this._audioContext) {
-      await this._audioContext.close();
+      await this._audioContext.close().catch(() => {});
       this._audioContext = null;
     }
-
-    this._workletNode = null;
+    if (this._playbackContext) {
+      await this._playbackContext.close().catch(() => {});
+      this._playbackContext = null;
+    }
     this._gainNode = null;
-    this._binaryHandlerId = null;
+    this._audioQueue = [];
+    this._isPlaying = false;
   }
 
-  _sendAudio(buffer) {
-    if (!this._active || !this._binaryHandlerId) return;
+  // Send audio to HA via JSON (proxy compatible)
+  _sendAudio(int16Array) {
+    if (!this._active) return;
 
-    // Send binary data to HA
-    // The binary handler ID tells HA which session this belongs to
-    const data = new Uint8Array(buffer);
-    this._hass.connection.socket.send(data);
-  }
-
-  _handleBinaryMessage(event) {
-    if (!(event.data instanceof ArrayBuffer)) return;
-    if (!this._active || !this._audioContext) return;
-
-    // Play received audio
-    const audioData = new Int16Array(event.data);
-
-    // Convert Int16 to Float32
-    const float32 = new Float32Array(audioData.length);
-    for (let i = 0; i < audioData.length; i++) {
-      float32[i] = audioData[i] / 32768.0;
+    // Convert Int16Array to base64 - chunked to avoid huge string concat
+    const bytes = new Uint8Array(int16Array.buffer);
+    let binary = "";
+    const chunkSize = 0x8000; // 32KB chunks for string building
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+      binary += String.fromCharCode.apply(null, chunk);
     }
+    const b64 = btoa(binary);
 
-    // Create and play buffer
-    const audioBuffer = this._audioContext.createBuffer(1, float32.length, 16000);
-    audioBuffer.getChannelData(0).set(float32);
+    // Send via JSON WebSocket message
+    this._hass.connection.sendMessage({
+      type: "intercom_native/audio",
+      device_id: this.config.device_id,
+      audio: b64,
+    });
 
-    const bufferSource = this._audioContext.createBufferSource();
-    bufferSource.buffer = audioBuffer;
-    bufferSource.connect(this._gainNode);
-    this._gainNode.connect(this._audioContext.destination);
-    bufferSource.start();
-  }
-
-  _setVolume(value) {
-    const volume = value / 100;
-    if (this._gainNode) {
-      this._gainNode.gain.value = volume;
-    }
-    // Also set ESP volume via service call
-    if (this._hass && this.config.volume_entity) {
-      this._hass.callService("number", "set_value", {
-        entity_id: this.config.volume_entity,
-        value: value,
-      });
+    this._chunksSent++;
+    if (this._chunksSent % 25 === 0) {  // Log more often since chunks are bigger now
+      this._updateStats();
     }
   }
 
-  _showError(message) {
-    const errorEl = this.shadowRoot.getElementById("errorMsg");
-    if (errorEl) {
-      errorEl.textContent = message;
+  // Handle audio from ESP
+  _handleAudioEvent(event) {
+    // Log first few events for debugging
+    if (this._chunksReceived < 5) {
+      console.log("[Intercom] Event received:", event);
+      console.log("[Intercom] event.data:", event.data);
+      console.log("[Intercom] config.device_id:", this.config.device_id);
+    }
+
+    if (!event.data) {
+      if (this._chunksReceived < 5) this._log("Event has no data");
+      return;
+    }
+    if (event.data.device_id !== this.config.device_id) {
+      if (this._chunksReceived < 5) this._log(`Device mismatch: ${event.data.device_id} vs ${this.config.device_id}`);
+      return;
+    }
+    if (!this._active) {
+      if (this._chunksReceived < 5) this._log("Not active, ignoring");
+      return;
+    }
+    if (!this._playbackContext) {
+      if (this._chunksReceived < 5) this._log("No playback context");
+      return;
+    }
+
+    this._chunksReceived++;
+    if (this._chunksReceived <= 5 || this._chunksReceived % 50 === 0) {
+      this._updateStats();
+      this._log(`Recv #${this._chunksReceived}: queue=${this._audioQueue.length}`);
+    }
+
+    try {
+      // Decode base64
+      const binary = atob(event.data.audio);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+
+      // Convert to Int16 then Float32
+      const int16 = new Int16Array(bytes.buffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768.0;
+      }
+
+      this._audioQueue.push(float32);
+      this._playQueue();
+    } catch (err) {
+      this._log("Recv error: " + err.message);
     }
   }
 
-  getCardSize() {
-    return 3;
+  _playQueue() {
+    if (this._isPlaying || this._audioQueue.length === 0) return;
+    if (!this._playbackContext || !this._gainNode) return;
+
+    this._isPlaying = true;
+    const float32 = this._audioQueue.shift();
+
+    try {
+      const buffer = this._playbackContext.createBuffer(1, float32.length, 16000);
+      buffer.getChannelData(0).set(float32);
+
+      const src = this._playbackContext.createBufferSource();
+      src.buffer = buffer;
+      src.connect(this._gainNode);
+      src.onended = () => {
+        this._isPlaying = false;
+        this._playQueue();
+      };
+      src.start();
+    } catch (err) {
+      this._isPlaying = false;
+    }
   }
 
-  static getConfigElement() {
-    return document.createElement("intercom-card-editor");
-  }
-
+  getCardSize() { return 3; }
   static getStubConfig() {
-    return {
-      device_id: "",
-      host: "",
-      name: "Intercom",
-    };
+    return { device_id: "", host: "", name: "Intercom" };
   }
 }
 
 customElements.define("intercom-card", IntercomCard);
-
-// Register card
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: "intercom-card",
