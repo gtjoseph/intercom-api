@@ -198,7 +198,7 @@ void IntercomApi::disconnect() {
 
 const char *IntercomApi::get_state_str() const {
   switch (this->state_) {
-    case ConnectionState::DISCONNECTED: return "Disconnected";
+    case ConnectionState::DISCONNECTED: return "Idle";
     case ConnectionState::CONNECTING: return "Connecting";
     case ConnectionState::CONNECTED: return "Connected";
     case ConnectionState::STREAMING: return "Streaming";

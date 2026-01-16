@@ -185,10 +185,18 @@ if (this->client_.streaming.load()) {
 
 ---
 
+## TODO - Prossime Feature
+
+Vedi `PLAN-ESP-PHONE-SYSTEM.md` per il piano completo.
+
+- [ ] **Fase 1**: Echo Cancellation (esp_aec)
+- [ ] **Fase 2**: ESP↔ESP con HA broker
+- [ ] **Fase 3**: HA Automations per signaling
+- [ ] **Fase 4**: Lista contatti dinamica
+- [ ] **Fase 5**: Card unificata
+
 ## TODO - Priorità Bassa
 
-- [ ] ESP→ESP direct mode
-- [ ] Echo cancellation (AEC)
 - [ ] Frontend: resampling 44.1kHz
 
 ---

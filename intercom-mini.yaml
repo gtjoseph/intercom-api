@@ -147,15 +147,6 @@ intercom_api:
   dc_offset_removal: true   # Required for SPH0645 (has DC bias)
 
 # ==============================================================================
-# INTERCOM SWITCH (on/off control)
-# ==============================================================================
-switch:
-  - platform: intercom_api
-    id: intercom_switch
-    name: "Intercom"
-    icon: "mdi:phone"
-
-# ==============================================================================
 # VOLUME & GAIN CONTROL
 # ==============================================================================
 number:
@@ -207,16 +198,6 @@ light:
           name: "Streaming"
           min_brightness: 20%
           max_brightness: 100%
-
-# ==============================================================================
-# BINARY SENSORS (status)
-# ==============================================================================
-binary_sensor:
-  - platform: template
-    id: intercom_connected
-    name: "Intercom Connected"
-    icon: "mdi:phone-check"
-    lambda: 'return id(intercom).is_connected();'
 
 # ==============================================================================
 # TEXT SENSORS (status)
