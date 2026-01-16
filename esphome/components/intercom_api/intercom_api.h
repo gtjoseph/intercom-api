@@ -74,6 +74,10 @@ class IntercomApi : public Component {
   void set_volume(float volume);
   float get_volume() const { return this->volume_; }
 
+  // Mic gain control
+  void set_mic_gain(float gain);
+  float get_mic_gain() const { return this->mic_gain_; }
+
   // Client mode (for ESP→ESP)
   void connect_to(const std::string &host, uint16_t port = INTERCOM_PORT);
   void disconnect();
@@ -163,6 +167,9 @@ class IntercomApi : public Component {
   // Volume
   float volume_{1.0f};
 
+  // Mic gain (applied before sending to network)
+  float mic_gain_{1.0f};
+
   // Mic configuration
   int mic_bits_{16};              // 16 or 32 bit mic
   bool dc_offset_removal_{false}; // Enable for mics with DC bias (SPH0645)
@@ -193,6 +200,15 @@ class IntercomApiVolume : public number::Number, public Parented<IntercomApi> {
  public:
   void control(float value) override {
     this->parent_->set_volume(value / 100.0f);
+    this->publish_state(value);
+  }
+};
+
+// Number for mic gain control
+class IntercomApiMicGain : public number::Number, public Parented<IntercomApi> {
+ public:
+  void control(float value) override {
+    this->parent_->set_mic_gain(value / 100.0f);
     this->publish_state(value);
   }
 };

@@ -176,6 +176,12 @@ void IntercomApi::set_volume(float volume) {
 #endif
 }
 
+void IntercomApi::set_mic_gain(float gain) {
+  // Allow 0x to 2x gain (0% to 200%)
+  this->mic_gain_ = std::max(0.0f, std::min(2.0f, gain));
+  ESP_LOGD(TAG, "Mic gain set to %.2f", this->mic_gain_);
+}
+
 void IntercomApi::connect_to(const std::string &host, uint16_t port) {
   this->client_mode_ = true;
   this->remote_host_ = host;
@@ -934,6 +940,9 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
         sample -= (this->dc_offset_ >> 8);
       }
 
+      // Apply mic gain
+      sample = static_cast<int32_t>(sample * this->mic_gain_);
+
       // Clamp to int16_t range
       if (sample > 32767) sample = 32767;
       if (sample < -32768) sample = -32768;
@@ -952,18 +961,26 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
       ESP_LOGW(TAG, "Mic mutex timeout, dropping %zu samples", num_samples);
     }
   } else {
-    // 16-bit mic - pass through directly (optional DC offset removal)
-    if (this->dc_offset_removal_) {
-      const int16_t *samples_16 = reinterpret_cast<const int16_t *>(data);
-      size_t num_samples = len / sizeof(int16_t);
+    // 16-bit mic - apply gain and optional DC offset removal
+    const int16_t *samples_16 = reinterpret_cast<const int16_t *>(data);
+    size_t num_samples = len / sizeof(int16_t);
 
+    // Only process if gain != 1.0 or dc_offset_removal is enabled
+    if (this->mic_gain_ != 1.0f || this->dc_offset_removal_) {
       int16_t converted[512];
       if (num_samples > 512) num_samples = 512;
 
       for (size_t i = 0; i < num_samples; i++) {
         int32_t sample = samples_16[i];
-        this->dc_offset_ = ((this->dc_offset_ * 255) >> 8) + sample;
-        sample -= (this->dc_offset_ >> 8);
+
+        if (this->dc_offset_removal_) {
+          this->dc_offset_ = ((this->dc_offset_ * 255) >> 8) + sample;
+          sample -= (this->dc_offset_ >> 8);
+        }
+
+        // Apply mic gain
+        sample = static_cast<int32_t>(sample * this->mic_gain_);
+
         if (sample > 32767) sample = 32767;
         if (sample < -32768) sample = -32768;
         converted[i] = static_cast<int16_t>(sample);
@@ -974,7 +991,7 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
         xSemaphoreGive(this->mic_mutex_);
       }
     } else {
-      // Direct passthrough
+      // Direct passthrough (gain=1.0 and no DC offset removal)
       if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
         this->mic_buffer_->write((void *)data, len);
         xSemaphoreGive(this->mic_mutex_);

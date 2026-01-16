@@ -44,6 +44,9 @@ esphome:
           // Restore speaker volume from saved state
           float vol = id(speaker_volume).state / 100.0f;
           id(intercom).set_volume(vol);
+          // Restore mic gain from saved state
+          float gain = id(mic_gain).state / 100.0f;
+          id(intercom).set_mic_gain(gain);
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -154,7 +157,7 @@ switch:
     icon: "mdi:phone"
 
 # ==============================================================================
-# VOLUME CONTROL
+# VOLUME & GAIN CONTROL
 # ==============================================================================
 number:
   - platform: template
@@ -172,6 +175,22 @@ number:
       - lambda: |-
           float vol = x / 100.0f;
           id(intercom).set_volume(vol);
+
+  - platform: template
+    id: mic_gain
+    name: "Mic Gain"
+    icon: "mdi:microphone"
+    min_value: 0
+    max_value: 200
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    set_action:
+      - lambda: |-
+          float gain = x / 100.0f;
+          id(intercom).set_mic_gain(gain);
 
 # ==============================================================================
 # STATUS LED (WS2812 RGB on GPIO21)

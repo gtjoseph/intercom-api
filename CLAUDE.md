@@ -18,7 +18,7 @@
 ## Overview
 
 Sistema intercom bidirezionale full-duplex che usa TCP invece di UDP/WebRTC.
-**Versione: 1.0.0** - Stabile e funzionante.
+**Versione: 1.0.1** - Stabile e funzionante con controllo mic gain.
 
 ## Repository
 
@@ -155,7 +155,7 @@ ssh root@192.168.1.10 'journalctl -u homeassistant -f'
 
 ---
 
-## Fix principali applicati (v1.0.0)
+## Fix principali applicati (v1.0.1)
 
 ### ROOT CAUSE della latenza HA→ESP
 In `server_task_()` c'era:
@@ -181,6 +181,7 @@ if (this->client_.streaming.load()) {
 5. HA: Queue-based audio (8 slot) invece di task per frame
 6. HA: No ping durante streaming
 7. Volume unico (template con restore_value) invece di due
+8. **v1.0.1**: Mic gain control (0%-200%) - utile per effetto doppler
 
 ---
 
