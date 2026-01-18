@@ -232,9 +232,8 @@ void IntercomApi::stop() {
 
   ESP_LOGI(TAG, "Stopping intercom");
 
-  // Give tasks time to notice active=false before closing socket
+  // set_active_(false) handles synchronization: waits for tasks, then stops hardware
   this->set_active_(false);
-  vTaskDelay(pdMS_TO_TICKS(20));
 
   // Close client connection and reset buffers
   this->close_client_socket_();
@@ -365,18 +364,36 @@ void IntercomApi::set_active_(bool on) {
   bool was = this->active_.exchange(on, std::memory_order_acq_rel);
   if (was == on) return;  // No change
 
+  if (on) {
+    // Starting - start mic and speaker immediately
 #ifdef USE_MICROPHONE
-  if (this->microphone_) {
-    on ? this->microphone_->start() : this->microphone_->stop();
-  }
+    if (this->microphone_) {
+      this->microphone_->start();
+    }
 #endif
 #ifdef USE_SPEAKER
-  if (this->speaker_) {
-    on ? this->speaker_->start() : this->speaker_->stop();
-  }
+    if (this->speaker_) {
+      this->speaker_->start();
+    }
 #endif
+    this->start_trigger_.trigger();
+  } else {
+    // Stopping - MUST wait for tasks to stop using speaker before stopping hardware
+    // This avoids race condition where speaker_task calls play() while speaker is stopping
+    vTaskDelay(pdMS_TO_TICKS(100));  // Wait for tasks to notice active_=false
 
-  on ? this->start_trigger_.trigger() : this->stop_trigger_.trigger();
+#ifdef USE_MICROPHONE
+    if (this->microphone_) {
+      this->microphone_->stop();
+    }
+#endif
+#ifdef USE_SPEAKER
+    if (this->speaker_) {
+      this->speaker_->stop();
+    }
+#endif
+    this->stop_trigger_.trigger();
+  }
 }
 
 void IntercomApi::set_streaming_(bool on) {
