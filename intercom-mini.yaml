@@ -402,29 +402,36 @@ sensor:
     update_interval: 60s
 
 button:
-  # Call/Answer/Hangup button (P2P mode - calls Home Assistant)
+  # Call/Answer/Hangup button - uses if/else to prevent automation continuation bugs
   - platform: template
     id: call_button
     name: "Call"
     icon: "mdi:phone"
     on_press:
-      - lambda: |-
-          std::string state = id(intercom_state).state;
-
-          // If ringing (incoming call), answer it
-          if (state == "Ringing") {
-            id(intercom).answer_call();
-            return;
-          }
-
-          // If in call or streaming, hang up
-          if (state == "Streaming" || state == "Calling") {
-            id(intercom).stop();
-            return;
-          }
-
-          // IDLE: Start call to Home Assistant
-          id(intercom).start();
+      - if:
+          condition:
+            text_sensor.state:
+              id: intercom_state
+              state: "Ringing"
+          then:
+            # Incoming call: Answer
+            - lambda: 'id(intercom).answer_call();'
+          else:
+            - if:
+                condition:
+                  or:
+                    - text_sensor.state:
+                        id: intercom_state
+                        state: "Streaming"
+                    - text_sensor.state:
+                        id: intercom_state
+                        state: "Calling"
+                then:
+                  # In call: Hangup
+                  - lambda: 'id(intercom).stop();'
+                else:
+                  # Idle: Start call to Home Assistant
+                  - lambda: 'id(intercom).start();'
 
   - platform: template
     id: previous_contact_button

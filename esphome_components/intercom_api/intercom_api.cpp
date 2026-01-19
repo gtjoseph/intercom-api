@@ -30,6 +30,14 @@ void IntercomApi::setup() {
     return;
   }
 
+  // Create speaker stop semaphore (for single-owner speaker model)
+  this->speaker_stopped_sem_ = xSemaphoreCreateBinary();
+  if (!this->speaker_stopped_sem_) {
+    ESP_LOGE(TAG, "Failed to create speaker semaphore");
+    this->mark_failed();
+    return;
+  }
+
   // Allocate ring buffers
   this->mic_buffer_ = RingBuffer::create(TX_BUFFER_SIZE);
   this->speaker_buffer_ = RingBuffer::create(RX_BUFFER_SIZE);
@@ -339,7 +347,9 @@ void IntercomApi::set_active_(bool on) {
   if (was == on) return;  // No change
 
   if (on) {
-    // Starting - start mic and speaker immediately
+    // Starting - clear any pending stop request and start hardware
+    this->speaker_stop_requested_.store(false, std::memory_order_release);
+
 #ifdef USE_MICROPHONE
     if (this->microphone_) {
       this->microphone_->start();
@@ -352,20 +362,32 @@ void IntercomApi::set_active_(bool on) {
 #endif
     this->start_trigger_.trigger();
   } else {
-    // Stopping - MUST wait for tasks to stop using speaker before stopping hardware
-    // This avoids race condition where speaker_task calls play() while speaker is stopping
-    vTaskDelay(pdMS_TO_TICKS(100));  // Wait for tasks to notice active_=false
+    // Stopping - use single-owner model for speaker to avoid race conditions
+    // 1. Request speaker_task to stop the speaker
+    // 2. Wait for acknowledgment (with timeout)
+    // 3. Speaker task will call speaker_->stop() safely
+
+#ifdef USE_SPEAKER
+    if (this->speaker_ && this->speaker_stopped_sem_) {
+      // Request speaker task to stop
+      this->speaker_stop_requested_.store(true, std::memory_order_release);
+
+      // Wait for speaker task to acknowledge (max 200ms)
+      if (xSemaphoreTake(this->speaker_stopped_sem_, pdMS_TO_TICKS(200)) != pdTRUE) {
+        ESP_LOGW(TAG, "Speaker stop timeout - forcing stop");
+        // Fallback: stop directly if task didn't respond
+        this->speaker_->stop();
+      }
+      this->speaker_stop_requested_.store(false, std::memory_order_release);
+    }
+#endif
 
 #ifdef USE_MICROPHONE
     if (this->microphone_) {
       this->microphone_->stop();
     }
 #endif
-#ifdef USE_SPEAKER
-    if (this->speaker_) {
-      this->speaker_->stop();
-    }
-#endif
+
     this->stop_trigger_.trigger();
   }
 }
@@ -696,6 +718,23 @@ void IntercomApi::speaker_task_() {
   uint8_t audio_chunk[AUDIO_CHUNK_SIZE * 4];
 
   while (true) {
+    // Check for stop request - single-owner model: only this task stops speaker
+    if (this->speaker_stop_requested_.load(std::memory_order_acquire)) {
+      if (this->speaker_ != nullptr) {
+        ESP_LOGD(TAG, "Speaker task: stopping speaker");
+        this->speaker_->stop();
+      }
+      // Signal that speaker has stopped
+      if (this->speaker_stopped_sem_ != nullptr) {
+        xSemaphoreGive(this->speaker_stopped_sem_);
+      }
+      // Wait for next activation
+      while (this->speaker_stop_requested_.load(std::memory_order_acquire)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+      }
+      continue;
+    }
+
     // Wait until active
     if (!this->active_.load(std::memory_order_acquire) || this->speaker_ == nullptr) {
       vTaskDelay(pdMS_TO_TICKS(20));
@@ -907,10 +946,15 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
       }
       break;
 
-    case MessageType::START:
-      ESP_LOGI(TAG, "Received START from client (auto_answer=%s)", this->auto_answer_ ? "ON" : "OFF");
-      if (this->auto_answer_) {
-        // Auto-answer ON: start streaming immediately
+    case MessageType::START: {
+      // Check for NO_RING flag (used for caller in bridge mode - skip ringing)
+      const bool no_ring = (header.flags & static_cast<uint8_t>(MessageFlags::NO_RING)) != 0;
+      ESP_LOGI(TAG, "Received START from client (auto_answer=%s, no_ring=%s)",
+               this->auto_answer_ ? "ON" : "OFF", no_ring ? "YES" : "NO");
+
+      if (this->auto_answer_ || no_ring) {
+        // Auto-answer ON or NO_RING flag: start streaming immediately
+        this->pending_incoming_call_ = false;
         this->set_active_(true);
         this->set_streaming_(true);
         this->send_message_(this->client_.socket.load(), MessageType::PONG);
@@ -924,6 +968,7 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
         this->ringing_trigger_.trigger();
       }
       break;
+    }
 
     case MessageType::STOP:
       ESP_LOGI(TAG, "Received STOP from client");
@@ -943,6 +988,20 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
         // ACK for START - begin streaming
         this->client_.streaming.store(true);
         this->state_ = ConnectionState::STREAMING;
+      }
+      break;
+
+    case MessageType::ANSWER:
+      // Remote answer from HA (when user clicks Answer in card)
+      ESP_LOGI(TAG, "Received ANSWER from client - remote answer");
+      if (this->pending_incoming_call_) {
+        this->pending_incoming_call_ = false;
+        this->set_active_(true);
+        this->set_streaming_(true);
+        // Send PONG as acknowledgment (like local answer)
+        this->send_message_(this->client_.socket.load(), MessageType::PONG);
+      } else {
+        ESP_LOGW(TAG, "ANSWER received but no pending call");
       }
       break;
 
@@ -1007,17 +1066,18 @@ void IntercomApi::close_server_socket_() {
 }
 
 void IntercomApi::close_client_socket_() {
-  xSemaphoreTake(this->client_mutex_, portMAX_DELAY);
-  if (this->client_.socket.load() >= 0) {
-    // Send STOP if streaming
-    if (this->client_.streaming.load()) {
-      this->send_message_(this->client_.socket.load(), MessageType::STOP);
-    }
-    close(this->client_.socket.load());
-    this->client_.socket.store(-1);
-    this->client_.streaming.store(false);
+  // Lock-free socket close: atomically get and invalidate socket
+  // This prevents race conditions without needing mutex timeout hacks
+  this->client_.streaming.store(false);
+
+  int sock = this->client_.socket.exchange(-1);
+  if (sock >= 0) {
+    // Try to send STOP before closing (best effort)
+    this->send_message_(sock, MessageType::STOP);
+    // Graceful shutdown then close
+    shutdown(sock, SHUT_RDWR);
+    close(sock);
   }
-  xSemaphoreGive(this->client_mutex_);
 }
 
 void IntercomApi::accept_client_() {
@@ -1066,6 +1126,7 @@ void IntercomApi::accept_client_() {
   inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
   ESP_LOGI(TAG, "Client connected from %s", ip_str);
 
+  // Use mutex for non-atomic addr field
   xSemaphoreTake(this->client_mutex_, portMAX_DELAY);
   this->client_.socket.store(client_sock);
   this->client_.addr = client_addr;
@@ -1118,6 +1179,11 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
     if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
       this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
       xSemaphoreGive(this->mic_mutex_);
+    } else {
+      static uint32_t mic_drops_32 = 0;
+      if (++mic_drops_32 <= 5 || mic_drops_32 % 100 == 0) {
+        ESP_LOGW(TAG, "Mic data dropped (32-bit): %lu total", (unsigned long)mic_drops_32);
+      }
     }
   } else {
     // 16-bit mic - apply gain and optional DC offset removal
@@ -1148,12 +1214,22 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
       if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
         this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
         xSemaphoreGive(this->mic_mutex_);
+      } else {
+        static uint32_t mic_drops_16g = 0;
+        if (++mic_drops_16g <= 5 || mic_drops_16g % 100 == 0) {
+          ESP_LOGW(TAG, "Mic data dropped (16-bit gain): %lu total", (unsigned long)mic_drops_16g);
+        }
       }
     } else {
       // Direct passthrough (gain=1.0 and no DC offset removal)
       if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
         this->mic_buffer_->write((void *)data, len);
         xSemaphoreGive(this->mic_mutex_);
+      } else {
+        static uint32_t mic_drops_16 = 0;
+        if (++mic_drops_16 <= 5 || mic_drops_16 % 100 == 0) {
+          ESP_LOGW(TAG, "Mic data dropped (16-bit): %lu total", (unsigned long)mic_drops_16);
+        }
       }
     }
   }

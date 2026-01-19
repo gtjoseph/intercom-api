@@ -194,6 +194,11 @@ class IntercomApi : public Component {
   TaskHandle_t tx_task_handle_{nullptr};
   TaskHandle_t speaker_task_handle_{nullptr};
 
+  // Speaker single-owner: only speaker_task_ touches speaker hardware
+  // This prevents race conditions between play() and stop()
+  std::atomic<bool> speaker_stop_requested_{false};
+  SemaphoreHandle_t speaker_stopped_sem_{nullptr};  // Signaled when speaker has stopped
+
   // Volume
   float volume_{1.0f};
 

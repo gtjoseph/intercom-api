@@ -11,7 +11,7 @@
  * - Audio bridged through HA between two ESP devices
  */
 
-const INTERCOM_CARD_VERSION = "3.0.3";
+const INTERCOM_CARD_VERSION = "3.1.0";
 
 class IntercomCard extends HTMLElement {
   constructor() {
@@ -45,6 +45,7 @@ class IntercomCard extends HTMLElement {
     this._destinationSensorEntityId = null;   // Text sensor showing current destination
     this._previousButtonEntityId = null;       // Previous contact button
     this._nextButtonEntityId = null;           // Next contact button
+    this._callButtonEntityId = null;           // Call/Answer button on ESP
     this._lastEspState = null;
     this._lastStopTime = null;                 // Debounce state changes after stop
   }
@@ -128,51 +129,63 @@ class IntercomCard extends HTMLElement {
 
   async _findEntityIds() {
     if (!this._hass) return;
-    const deviceId = this._getConfigDeviceId();
-    if (!deviceId) return;
 
+    // Get device info - includes entities mapping from backend (no admin perms needed)
     const deviceInfo = await this._getDeviceInfo();
-    if (!deviceInfo?.name) return;
+    if (!deviceInfo?.device_id) return;
 
-    // Try multiple name formats (e.g., "Intercom Mini" -> "intercom_mini", "intercom-mini")
-    const deviceNameVariants = [
-      deviceInfo.name.toLowerCase().replace(/\s+/g, '_'),
-      deviceInfo.name.toLowerCase().replace(/\s+/g, '-'),
-      deviceInfo.name.toLowerCase().replace(/\s+/g, ''),
-    ];
+    // Prefer entities mapping from backend (no admin permissions required)
+    if (deviceInfo.entities && typeof deviceInfo.entities === "object") {
+      const e = deviceInfo.entities;
+      this._intercomStateEntityId = e.intercom_state || null;
+      this._incomingCallerEntityId = e.incoming_caller || null;
+      this._destinationSensorEntityId = e.destination || null;
+      this._previousButtonEntityId = e.previous || null;
+      this._nextButtonEntityId = e.next || null;
+      this._callButtonEntityId = e.call || null;
 
-    // Search for entities belonging to this device
-    for (const [entityId] of Object.entries(this._hass.states)) {
-      const entityIdLower = entityId.toLowerCase();
-
-      for (const nameVariant of deviceNameVariants) {
-        if (entityIdLower.includes("intercom_state") && entityIdLower.includes(nameVariant)) {
-          this._intercomStateEntityId = entityId;
-        }
-        if (entityIdLower.includes("incoming_caller") && entityIdLower.includes(nameVariant)) {
-          this._incomingCallerEntityId = entityId;
-        }
-        // Find the destination text sensor
-        if (entityIdLower.startsWith("sensor.") && entityIdLower.includes("destination") && entityIdLower.includes(nameVariant)) {
-          this._destinationSensorEntityId = entityId;
-        }
-        // Find previous/next contact buttons
-        if (entityIdLower.startsWith("button.") && entityIdLower.includes("previous") && entityIdLower.includes(nameVariant)) {
-          this._previousButtonEntityId = entityId;
-        }
-        if (entityIdLower.startsWith("button.") && entityIdLower.includes("next") && entityIdLower.includes(nameVariant)) {
-          this._nextButtonEntityId = entityId;
-        }
-      }
+      console.log("Entity IDs from backend for device", deviceInfo.device_id, ":", {
+        state: this._intercomStateEntityId,
+        caller: this._incomingCallerEntityId,
+        destination: this._destinationSensorEntityId,
+        prevBtn: this._previousButtonEntityId,
+        nextBtn: this._nextButtonEntityId,
+        callBtn: this._callButtonEntityId
+      });
+      return;
     }
 
-    console.log("Found entity IDs:", {
-      state: this._intercomStateEntityId,
-      caller: this._incomingCallerEntityId,
-      destination: this._destinationSensorEntityId,
-      prevBtn: this._previousButtonEntityId,
-      nextBtn: this._nextButtonEntityId
-    });
+    // Fallback: query entity registry (may require admin permissions)
+    const haDeviceId = deviceInfo.device_id;
+    try {
+      const entityRegistry = await this._hass.connection.sendMessagePromise({
+        type: "config/entity_registry/list",
+      });
+
+      if (!entityRegistry) return;
+
+      for (const entity of entityRegistry) {
+        if (entity.device_id !== haDeviceId) continue;
+        const id = entity.entity_id;
+        if (id.includes("intercom_state")) this._intercomStateEntityId = id;
+        else if (id.includes("incoming_caller")) this._incomingCallerEntityId = id;
+        else if (id.includes("destination")) this._destinationSensorEntityId = id;
+        else if (id.startsWith("button.") && id.includes("previous")) this._previousButtonEntityId = id;
+        else if (id.startsWith("button.") && id.includes("next")) this._nextButtonEntityId = id;
+        else if (id.startsWith("button.") && id.includes("call")) this._callButtonEntityId = id;
+      }
+
+      console.log("Entity IDs from registry for device", haDeviceId, ":", {
+        state: this._intercomStateEntityId,
+        caller: this._incomingCallerEntityId,
+        destination: this._destinationSensorEntityId,
+        prevBtn: this._previousButtonEntityId,
+        nextBtn: this._nextButtonEntityId,
+        callBtn: this._callButtonEntityId
+      });
+    } catch (err) {
+      console.error("Entity discovery failed:", err);
+    }
   }
 
   async _loadAvailableDevices() {
@@ -435,10 +448,11 @@ class IntercomCard extends HTMLElement {
   }
 
   async _answerIncoming() {
-    // Answer an incoming call detected via ESP state monitoring
-    // The ESP is already in Ringing state, we need to answer via ESPHome button
+    // Answer an incoming call via intercom_native/answer
+    // This works for both P2P sessions and bridge dest devices
+
     const deviceInfo = await this._getDeviceInfo();
-    if (!deviceInfo) {
+    if (!deviceInfo?.device_id) {
       this._showError("Device not found");
       return;
     }
@@ -448,25 +462,30 @@ class IntercomCard extends HTMLElement {
     this._render();
 
     try {
-      // Call the ESP's call button to answer (acts as toggle)
-      // Find the call button entity
-      for (const [entityId, state] of Object.entries(this._hass.states)) {
-        if (entityId.startsWith("button.") && entityId.includes("call") &&
-            entityId.toLowerCase().includes(deviceInfo.name?.toLowerCase().replace(/\s+/g, '_'))) {
-          await this._hass.callService("button", "press", { entity_id: entityId });
-          break;
-        }
+      // Try WS answer command first (works for sessions and bridges)
+      const res = await this._hass.connection.sendMessagePromise({
+        type: "intercom_native/answer",
+        device_id: deviceInfo.device_id,
+      });
+
+      if (res?.success) {
+        // Don't force _active=true - wait for "streaming" event
+        this._showError("");
+        this._starting = false;
+        this._render();
+        return;
       }
 
-      // Wait a moment for ESP to process
-      await new Promise(r => setTimeout(r, 500));
-
-      this._ringing = false;
-      this._active = true;
-      this._starting = false;
-      this._render();
+      // Fallback: press call button on ESP
+      if (this._callButtonEntityId) {
+        await this._hass.callService("button", "press", { entity_id: this._callButtonEntityId });
+        this._showError("");
+      } else {
+        throw new Error("Answer failed and no call button available");
+      }
     } catch (err) {
       this._showError(err.message || String(err));
+    } finally {
       this._starting = false;
       this._render();
     }
@@ -611,8 +630,10 @@ class IntercomCard extends HTMLElement {
         (e) => this._handleBridgeStateEvent(e), "intercom_bridge_state"
       );
 
-      this._active = true;
-      this._calling = false;
+      // Set state based on bridge result (connected or ringing)
+      const st = result.state || "calling";
+      this._active = (st === "connected");
+      this._calling = (st !== "connected");  // ringing or calling
       this._starting = false;
       this._render();
     } catch (err) {
@@ -631,8 +652,20 @@ class IntercomCard extends HTMLElement {
     const state = event.data.state;
     if (state === "connected") {
       this._active = true;
+      this._calling = false;
+      this._starting = false;
       this._render();
-    } else if (state === "disconnected") {
+    } else if (state === "calling") {
+      this._calling = true;
+      this._active = false;
+      this._starting = false;
+      this._render();
+    } else if (state === "ringing") {
+      // Dest ESP is ringing
+      this._calling = true;
+      this._active = false;
+      this._render();
+    } else if (state === "idle" || state === "disconnected") {
       this._hangup();
     }
   }
@@ -710,13 +743,21 @@ class IntercomCard extends HTMLElement {
       this._ringing = false;
       this._calling = false;
       this._active = true;
+      this._starting = false;
+      this._render();
+    } else if (state === "calling") {
+      // We're calling, waiting for response
+      this._calling = true;
+      this._active = false;
+      this._starting = false;
       this._render();
     } else if (state === "ringing") {
-      // ESP is ringing, we're calling
+      // ESP is ringing, waiting for answer
       this._calling = true;
       this._active = false;
       this._render();
-    } else if (state === "disconnected") {
+    } else if (state === "idle" || state === "disconnected") {
+      // Call ended - cleanup
       this._hangup();
     }
   }

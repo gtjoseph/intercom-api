@@ -458,41 +458,43 @@ switch:
 # BUTTONS
 # ==============================================================================
 button:
-  # Call/Answer/Hangup button (P2P mode - calls Home Assistant only)
+  # Call/Answer/Hangup button - uses if/else to prevent automation continuation bugs
   - platform: template
     id: call_button
     name: "Call"
     icon: "mdi:phone"
     on_press:
-      - lambda: |-
-          std::string state = id(intercom_state).state;
-
-          // If ringing (incoming call), answer it
-          if (state == "Ringing") {
-            id(intercom).answer_call();
-            id(speaker_enable).turn_on();
-            return;
-          }
-
-          // If in call or streaming, hang up
-          if (state == "Streaming" || state == "Calling") {
-            id(intercom).stop();
-            id(speaker_enable).turn_off();
-            return;
-          }
-
-          // IDLE: Call Home Assistant
-          id(speaker_enable).turn_on();
-      # Fire doorbell event when calling Home Assistant
       - if:
           condition:
-            lambda: 'return id(intercom_state).state == "Idle";'
+            text_sensor.state:
+              id: intercom_state
+              state: "Ringing"
           then:
-            - homeassistant.event:
-                event: esphome.doorbell_ring
-                data:
-                  device: "${name}"
-            - lambda: 'id(intercom).start();'
+            # Incoming call: Answer
+            - lambda: 'id(intercom).answer_call();'
+            - output.turn_on: speaker_enable
+          else:
+            - if:
+                condition:
+                  or:
+                    - text_sensor.state:
+                        id: intercom_state
+                        state: "Streaming"
+                    - text_sensor.state:
+                        id: intercom_state
+                        state: "Calling"
+                then:
+                  # In call: Hangup
+                  - lambda: 'id(intercom).stop();'
+                  - output.turn_off: speaker_enable
+                else:
+                  # Idle: Start call to Home Assistant
+                  - output.turn_on: speaker_enable
+                  - homeassistant.event:
+                      event: esphome.doorbell_ring
+                      data:
+                        device: "${name}"
+                  - lambda: 'id(intercom).start();'
 
   - platform: template
     id: previous_contact_button

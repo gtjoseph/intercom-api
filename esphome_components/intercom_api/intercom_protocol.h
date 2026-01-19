@@ -26,7 +26,8 @@ enum class MessageType : uint8_t {
 // Message flags
 enum class MessageFlags : uint8_t {
   NONE = 0x00,
-  END = 0x01,     // Last packet of stream
+  END = 0x01,      // Last packet of stream
+  NO_RING = 0x02,  // START flag: skip ringing, start streaming directly (for caller in bridge)
 };
 
 // Error codes

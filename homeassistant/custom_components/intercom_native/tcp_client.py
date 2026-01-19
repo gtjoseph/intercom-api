@@ -20,6 +20,7 @@ from .const import (
     MSG_RING,
     MSG_ANSWER,
     FLAG_NONE,
+    FLAG_NO_RING,
     CONNECT_TIMEOUT,
     PING_INTERVAL,
 )
@@ -137,21 +138,24 @@ class IntercomTcpClient:
         _LOGGER.debug("[TCP#%d] Disconnected (sent=%d recv=%d)",
                       self._instance_id, self._audio_sent, self._audio_recv)
 
-    async def start_stream(self) -> str:
+    async def start_stream(self, flags: int = FLAG_NONE) -> str:
         """Start streaming.
+
+        Args:
+            flags: Message flags (e.g., FLAG_NO_RING for caller in bridge mode)
 
         Returns:
             "streaming" - ESP accepted, streaming started
             "ringing" - ESP has auto_answer OFF, waiting for local answer
             "error" - Connection or send failed
         """
-        _LOGGER.debug("[TCP#%d] start_stream()", self._instance_id)
+        _LOGGER.debug("[TCP#%d] start_stream(flags=0x%02X)", self._instance_id, flags)
 
         if not self._connected:
             if not await self.connect():
                 return "error"
 
-        if not await self._send_message(MSG_START):
+        if not await self._send_message(MSG_START, flags=flags):
             return "error"
 
         # Wait briefly for ESP response (PONG=accept, RING=waiting)
@@ -195,6 +199,29 @@ class IntercomTcpClient:
                 _LOGGER.warning("[TCP#%d] STOP timeout", self._instance_id)
             except Exception as err:
                 _LOGGER.debug("[TCP#%d] STOP error: %s", self._instance_id, err)
+
+    async def send_answer(self) -> bool:
+        """Send ANSWER to ESP (for remote answer from card when ESP is ringing)."""
+        _LOGGER.debug("[TCP#%d] send_answer()", self._instance_id)
+
+        if not self._connected or not self._writer:
+            return False
+
+        if not self._ringing:
+            _LOGGER.warning("[TCP#%d] send_answer() but not ringing", self._instance_id)
+            return False
+
+        try:
+            await asyncio.wait_for(self._send_message(MSG_ANSWER), timeout=1.0)
+            _LOGGER.debug("[TCP#%d] ANSWER sent", self._instance_id)
+            # State will be updated when we receive PONG from ESP
+            return True
+        except asyncio.TimeoutError:
+            _LOGGER.warning("[TCP#%d] ANSWER timeout", self._instance_id)
+            return False
+        except Exception as err:
+            _LOGGER.error("[TCP#%d] ANSWER error: %s", self._instance_id, err)
+            return False
 
     async def send_audio(self, data: bytes) -> bool:
         """Send audio data - drain periodically to avoid blocking."""
