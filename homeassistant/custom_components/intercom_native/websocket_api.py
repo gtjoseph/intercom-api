@@ -140,7 +140,9 @@ class IntercomSession:
             }
         )
 
-        result = await self._tcp_client.start_stream()
+        # Send HA instance name as caller (for display on ESP)
+        caller_name = self.hass.config.location_name or "Home Assistant"
+        result = await self._tcp_client.start_stream(caller_name=caller_name)
 
         if result == "streaming":
             self._active = True
