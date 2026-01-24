@@ -135,7 +135,7 @@ i2s_audio_duplex:
   i2s_din_pin: GPIO10
   i2s_dout_pin: GPIO8
   sample_rate: 16000
-  aec_id: aec_component
+  # NOTE: AEC is handled by intercom_api, NOT here (to avoid double processing)
 
 # ==============================================================================
 # MICROPHONE (via duplex platform)

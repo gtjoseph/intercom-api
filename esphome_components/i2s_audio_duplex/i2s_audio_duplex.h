@@ -109,7 +109,7 @@ class I2SAudioDuplex : public Component {
 
   // AEC support
   esp_aec::EspAec *aec_{nullptr};
-  bool aec_enabled_{true};  // Runtime toggle
+  bool aec_enabled_{false};  // Runtime toggle (only enabled when aec_ is set)
   std::unique_ptr<RingBuffer> speaker_ref_buffer_;  // Reference for AEC
   uint32_t aec_frame_count_{0};  // Debug counter, reset on start()
 

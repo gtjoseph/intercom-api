@@ -983,7 +983,7 @@ void IntercomApi::tx_task_() {
             memset(this->aec_ref_, 0, ref_bytes_needed);
             static uint32_t last_warn = 0;
             if (millis() - last_warn > 5000) {
-              ESP_LOGW(TAG, "AEC: ref buffer low (%d/%d bytes)", ref_avail, ref_bytes_needed);
+              ESP_LOGW(TAG, "AEC: ref buffer low (%zu/%zu bytes)", ref_avail, ref_bytes_needed);
               last_warn = millis();
             }
           }

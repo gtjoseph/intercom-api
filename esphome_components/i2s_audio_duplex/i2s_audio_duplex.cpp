@@ -42,6 +42,8 @@ void I2SAudioDuplex::setup() {
 
 void I2SAudioDuplex::set_aec(esp_aec::EspAec *aec) {
   this->aec_ = aec;
+  // Enable AEC runtime flag only if AEC is actually configured
+  this->aec_enabled_ = (aec != nullptr);
   // Create speaker reference buffer for AEC now (since set_aec is called after setup)
   if (aec != nullptr && !this->speaker_ref_buffer_) {
     this->speaker_ref_buffer_ = RingBuffer::create(SPEAKER_BUFFER_SIZE);
@@ -395,15 +397,6 @@ void I2SAudioDuplex::audio_task_() {
           output_buffer = aec_output;
           if (++this->aec_frame_count_ % 500 == 0) {
             ESP_LOGD(TAG, "AEC processing: %lu frames", (unsigned long) this->aec_frame_count_);
-          }
-        } else {
-          static bool aec_skip_logged = false;
-          if (!aec_skip_logged) {
-            ESP_LOGW(TAG, "AEC skipped: aec=%p enabled=%d init=%d ref=%p out=%p",
-                     this->aec_, this->aec_enabled_,
-                     this->aec_ ? this->aec_->is_initialized() : false,
-                     spk_ref_buffer, aec_output);
-            aec_skip_logged = true;
           }
         }
 #endif
