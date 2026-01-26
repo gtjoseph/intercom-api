@@ -190,8 +190,8 @@ external_components:
       type: git
       url: https://github.com/n-IA-hane/intercom-api
       ref: main
+      path: esphome_components
     components: [intercom_api, esp_aec]
-    path: esphome_components
 ```
 
 #### Minimal Configuration (Simple Mode)
@@ -617,8 +617,8 @@ external_components:
       type: git
       url: https://github.com/n-IA-hane/intercom-api
       ref: main
+      path: esphome_components
     components: [intercom_api, i2s_audio_duplex, esp_aec]
-    path: esphome_components
 
 i2s_audio_duplex:
   id: i2s_duplex
