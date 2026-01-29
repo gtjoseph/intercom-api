@@ -32,10 +32,11 @@ esphome:
           brightness: 100%
       - light.turn_off: status_led
       - delay: 1s
-      # Restore ES8311 volume (different from intercom volume)
+      # Restore ES8311 volume and sync to i2s_duplex for AEC
       - lambda: |-
           float vol = 0.15 + (id(speaker_volume).state / 100.0) * 0.60;
           id(es8311_dac).set_volume(vol);
+          id(i2s_duplex).set_speaker_volume(vol);  // Sync for AEC reference
           id(peer_name) = id(intercom).get_current_destination();
       - script.execute: update_display_page
 
@@ -388,6 +389,7 @@ number:
       name: "Mic Gain"
 
   # Speaker volume with ES8311 hardware control (different from intercom_api volume)
+  # IMPORTANT: Also sync to i2s_duplex for AEC reference scaling
   - platform: template
     id: speaker_volume
     name: "Speaker Volume"
@@ -401,8 +403,12 @@ number:
     unit_of_measurement: "%"
     set_action:
       - lambda: |-
-          float vol = 0.15 + (x / 100.0) * 0.60;
-          id(es8311_dac).set_volume(vol);
+          // ES8311 volume range: 0.15 (min) to 0.75 (max)
+          float es8311_vol = 0.15 + (x / 100.0) * 0.60;
+          id(es8311_dac).set_volume(es8311_vol);
+          // Sync SAME volume to i2s_duplex for AEC reference scaling
+          // This ensures reference amplitude matches actual speaker output
+          id(i2s_duplex).set_speaker_volume(es8311_vol);
 
 # ==============================================================================
 # TEXT SENSORS

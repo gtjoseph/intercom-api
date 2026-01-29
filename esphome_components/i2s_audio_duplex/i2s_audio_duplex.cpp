@@ -483,7 +483,9 @@ void I2SAudioDuplex::audio_task_() {
       // This ensures the reference matches exactly what goes to the speaker
       // The reference buffer has a delay (pre-filled with silence) so when we read
       // during mic processing, we get the reference from ~80ms ago
-      if (this->speaker_ref_buffer_ != nullptr && got > 0) {
+      // CRITICAL: Always write to ref buffer, even when got=0 (silence padded)
+      // Otherwise ref buffer falls behind real-time, causing AEC desync
+      if (this->speaker_ref_buffer_ != nullptr) {
         this->speaker_ref_buffer_->write_without_replacement((void *) spk_buffer, frame_bytes, 0, true);
       }
 #endif
