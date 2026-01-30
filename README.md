@@ -349,7 +349,15 @@ lovelace:
 
 #### Add the card to your dashboard
 
+The card is available in the Lovelace card picker - just search for "Intercom":
+
+![Card Selection](readme-img/card-selection.png)
+
+Then configure it with the visual editor:
+
 ![Card Configuration](readme-img/card-configuration.png)
+
+Alternatively, you can add it manually via YAML:
 
 ```yaml
 type: custom:intercom-card
