@@ -11,8 +11,8 @@ DEPENDENCIES = ["esp32"]
 def _validate_esp32s3(config):
     if CORE.is_esp32:
         import esphome.components.esp32 as esp32
-        if esp32.get_esp32_variant() != "ESP32S3":
-            raise cv.Invalid("esp_aec requires ESP32-S3")
+        if esp32.get_esp32_variant() != "ESP32S3" and esp32.get_esp32_variant() != "ESP32P4":
+            raise cv.Invalid("esp_aec requires ESP32-S3 or ESP32-P4")
     return config
 
 esp_aec_ns = cg.esphome_ns.namespace("esp_aec")
