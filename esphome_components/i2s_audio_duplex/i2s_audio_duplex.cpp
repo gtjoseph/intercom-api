@@ -2,9 +2,10 @@
 
 #ifdef USE_ESP32
 
+#include <cmath>
+
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
-#include "esphome/core/application.h"
-#include "../intercom_api/intercom_protocol.h"  // For AEC delay constants
 
 #ifdef USE_ESP_AEC
 #include "../esp_aec/esp_aec.h"
@@ -13,10 +14,9 @@
 namespace esphome {
 namespace i2s_audio_duplex {
 
-static constexpr size_t SAMPLE_RATE = 16000;
 static constexpr size_t BYTES_PER_SAMPLE = 2;
 
-static const char *const TAG = "i2s_audio_duplex";
+static const char *const TAG = "i2s_duplex";
 
 // Audio parameters
 static const size_t DMA_BUFFER_COUNT = 8;
@@ -51,7 +51,7 @@ void I2SAudioDuplex::set_aec(esp_aec::EspAec *aec) {
   if (aec != nullptr && !this->speaker_ref_buffer_) {
     // Buffer needs to hold: delay samples + working frames
     // Use configurable delay (default 80ms, can be set lower for integrated codecs)
-    size_t delay_bytes = (SAMPLE_RATE * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+    size_t delay_bytes = (this->sample_rate_ * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
     size_t ref_buffer_size = delay_bytes + SPEAKER_BUFFER_SIZE;
     this->speaker_ref_buffer_ = RingBuffer::create(ref_buffer_size);
     if (this->speaker_ref_buffer_) {
@@ -72,10 +72,6 @@ void I2SAudioDuplex::dump_config() {
   ESP_LOGCONFIG(TAG, "  DOUT Pin: %d", this->dout_pin_);
   ESP_LOGCONFIG(TAG, "  Sample Rate: %d Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  AEC: %s", this->aec_ != nullptr ? "enabled" : "disabled");
-}
-
-void I2SAudioDuplex::loop() {
-  // Main loop - nothing needed, audio runs in separate task
 }
 
 bool I2SAudioDuplex::init_i2s_duplex_() {
@@ -116,7 +112,7 @@ bool I2SAudioDuplex::init_i2s_duplex_() {
 
   // Helper to convert pin number to gpio_num_t, using GPIO_NUM_NC for unused pins
   auto pin_or_nc = [](int pin) -> gpio_num_t {
-    return pin >= 0 ? (gpio_num_t) pin : GPIO_NUM_NC;
+    return pin >= 0 ? static_cast<gpio_num_t>(pin) : GPIO_NUM_NC;
   };
 
   // Standard mode configuration for TX (always mono)
@@ -219,7 +215,7 @@ void I2SAudioDuplex::start() {
   }
 
   // Small delay to ensure I2S is fully deinitialized from previous session
-  vTaskDelay(pdMS_TO_TICKS(50));
+  delay(50);
 
   ESP_LOGI(TAG, "Starting duplex audio...");
 
@@ -246,9 +242,9 @@ void I2SAudioDuplex::start() {
   // STEREO mode (ES8311 digital feedback) doesn't need this - reference is sample-aligned
   if (this->speaker_ref_buffer_ != nullptr && this->aec_ != nullptr && !this->use_stereo_aec_ref_) {
     this->speaker_ref_buffer_->reset();
-    size_t delay_bytes = (SAMPLE_RATE * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+    size_t delay_bytes = (this->sample_rate_ * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
     // Allocate temp buffer for silence
-    uint8_t *silence = (uint8_t *) heap_caps_calloc(1, delay_bytes, MALLOC_CAP_INTERNAL);
+    auto *silence = static_cast<uint8_t *>(heap_caps_calloc(1, delay_bytes, MALLOC_CAP_INTERNAL));
     if (silence) {
       this->speaker_ref_buffer_->write_without_replacement(silence, delay_bytes, 0, true);
       heap_caps_free(silence);
@@ -288,7 +284,7 @@ void I2SAudioDuplex::stop() {
 
   // Step 2: Wait for audio task to complete current I/O operation
   // I2S operations have 50ms timeout, so wait a bit longer
-  vTaskDelay(pdMS_TO_TICKS(60));
+  delay(60);
 
   // Step 3: Now safe to disable channels (task should be idle or exited)
   esp_err_t err;
@@ -309,7 +305,7 @@ void I2SAudioDuplex::stop() {
   if (this->audio_task_handle_) {
     int wait_count = 0;
     while (eTaskGetState(this->audio_task_handle_) != eDeleted && wait_count < 50) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+      delay(10);
       wait_count++;
     }
     this->audio_task_handle_ = nullptr;
@@ -373,10 +369,10 @@ size_t I2SAudioDuplex::play(const uint8_t *data, size_t len, TickType_t ticks_to
       if (num_samples <= 1024) {
         int16_t scaled[1024];
         for (size_t i = 0; i < num_samples; i++) {
-          int32_t sample = (int32_t)(src[i] * ref_scale);
+          int32_t sample = static_cast<int32_t>(src[i] * ref_scale);
           if (sample > 32767) sample = 32767;
           if (sample < -32768) sample = -32768;
-          scaled[i] = (int16_t) sample;
+          scaled[i] = static_cast<int16_t>(sample);
         }
         this->speaker_ref_buffer_->write_without_replacement((void *) scaled, written, 0, true);
       } else {
@@ -416,17 +412,17 @@ void I2SAudioDuplex::audio_task_() {
   size_t rx_frame_bytes = this->use_stereo_aec_ref_ ? (frame_bytes * 2) : frame_bytes;
 
   // Allocate DMA-capable buffers for I2S operations
-  int16_t *rx_buffer = (int16_t *) heap_caps_malloc(rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  auto *rx_buffer = static_cast<int16_t *>(heap_caps_malloc(rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
   int16_t *mic_buffer = this->use_stereo_aec_ref_ ?
-      (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL) : rx_buffer;
-  int16_t *spk_buffer = (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-  int16_t *spk_ref_buffer = nullptr;  // Speaker reference for AEC
-  int16_t *aec_output = nullptr;      // AEC processed output
+      static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL)) : rx_buffer;
+  auto *spk_buffer = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+  int16_t *spk_ref_buffer = nullptr;
+  int16_t *aec_output = nullptr;
 
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr) {
-    spk_ref_buffer = (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL);
-    aec_output = (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL);
+    spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL));
+    aec_output = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL));
   }
 #endif
 
@@ -476,7 +472,7 @@ void I2SAudioDuplex::audio_task_() {
         // This prevents clipping/distortion BEFORE AEC processing
         if (this->mic_attenuation_ != 1.0f) {
           for (size_t i = 0; i < frame_size; i++) {
-            mic_buffer[i] = (int16_t)(mic_buffer[i] * this->mic_attenuation_);
+            mic_buffer[i] = static_cast<int16_t>(mic_buffer[i] * this->mic_attenuation_);
           }
         }
 
@@ -488,7 +484,7 @@ void I2SAudioDuplex::audio_task_() {
           // ── MONO MODE: Get reference from ring buffer with delay ──
           if (!this->use_stereo_aec_ref_) {
             // Ring buffer approach: need to maintain delay
-            size_t delay_bytes = (SAMPLE_RATE * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+            size_t delay_bytes = (this->sample_rate_ * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
             size_t min_ref_bytes = delay_bytes + frame_bytes;
             size_t ref_available = this->speaker_ref_buffer_ ? this->speaker_ref_buffer_->available() : 0;
 
@@ -508,13 +504,13 @@ void I2SAudioDuplex::audio_task_() {
           if (++this->aec_frame_count_ % 500 == 0) {
             int64_t mic_sum = 0, ref_sum = 0, out_sum = 0;
             for (size_t i = 0; i < frame_size; i++) {
-              mic_sum += (int64_t)mic_buffer[i] * mic_buffer[i];
-              ref_sum += (int64_t)spk_ref_buffer[i] * spk_ref_buffer[i];
-              out_sum += (int64_t)aec_output[i] * aec_output[i];
+              mic_sum += static_cast<int64_t>(mic_buffer[i]) * mic_buffer[i];
+              ref_sum += static_cast<int64_t>(spk_ref_buffer[i]) * spk_ref_buffer[i];
+              out_sum += static_cast<int64_t>(aec_output[i]) * aec_output[i];
             }
-            int mic_rms = (int)sqrt((double)mic_sum / frame_size);
-            int ref_rms = (int)sqrt((double)ref_sum / frame_size);
-            int out_rms = (int)sqrt((double)out_sum / frame_size);
+            int mic_rms = static_cast<int>(std::sqrt(static_cast<double>(mic_sum) / frame_size));
+            int ref_rms = static_cast<int>(std::sqrt(static_cast<double>(ref_sum) / frame_size));
+            int out_rms = static_cast<int>(std::sqrt(static_cast<double>(out_sum) / frame_size));
             int reduction = (mic_rms > 0) ? (100 - (out_rms * 100 / mic_rms)) : 0;
             ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% %s)",
                      (unsigned long)this->aec_frame_count_, mic_rms, ref_rms, out_rms, reduction,
@@ -526,11 +522,10 @@ void I2SAudioDuplex::audio_task_() {
         // Apply mic gain
         if (this->mic_gain_ != 1.0f) {
           for (size_t i = 0; i < frame_size; i++) {
-            int32_t sample = (int32_t)(output_buffer[i] * this->mic_gain_);
-            // Clamp to int16_t range
+            int32_t sample = static_cast<int32_t>(output_buffer[i] * this->mic_gain_);
             if (sample > 32767) sample = 32767;
             if (sample < -32768) sample = -32768;
-            output_buffer[i] = (int16_t) sample;
+            output_buffer[i] = static_cast<int16_t>(sample);
           }
         }
 
@@ -559,10 +554,10 @@ void I2SAudioDuplex::audio_task_() {
       // Apply speaker volume with clamp
       if (this->speaker_volume_ != 1.0f) {
         for (size_t i = 0; i < frame_size; i++) {
-          int32_t sample = (int32_t)(spk_buffer[i] * this->speaker_volume_);
+          int32_t sample = static_cast<int32_t>(spk_buffer[i] * this->speaker_volume_);
           if (sample > 32767) sample = 32767;
           if (sample < -32768) sample = -32768;
-          spk_buffer[i] = (int16_t) sample;
+          spk_buffer[i] = static_cast<int16_t>(sample);
         }
       }
 
@@ -582,7 +577,7 @@ void I2SAudioDuplex::audio_task_() {
     if (did_work) {
       taskYIELD();
     } else {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      delay(1);
     }
   }
 

@@ -6,10 +6,10 @@ Voice Assistant and intercom_api components.
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_SAMPLE_RATE
 
 CODEOWNERS = ["@n-IA-hane"]
-DEPENDENCIES = []
+DEPENDENCIES = ["esp32"]
 AUTO_LOAD = ["switch", "number"]
 
 CONF_I2S_LRCLK_PIN = "i2s_lrclk_pin"
@@ -17,7 +17,6 @@ CONF_I2S_BCLK_PIN = "i2s_bclk_pin"
 CONF_I2S_MCLK_PIN = "i2s_mclk_pin"
 CONF_I2S_DIN_PIN = "i2s_din_pin"
 CONF_I2S_DOUT_PIN = "i2s_dout_pin"
-CONF_SAMPLE_RATE = "sample_rate"
 CONF_AEC_ID = "aec_id"
 CONF_AEC_REF_DELAY_MS = "aec_reference_delay_ms"
 CONF_MIC_ATTENUATION = "mic_attenuation"

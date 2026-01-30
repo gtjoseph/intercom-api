@@ -29,7 +29,6 @@ using MicDataCallback = std::function<void(const uint8_t *data, size_t len)>;
 class I2SAudioDuplex : public Component {
  public:
   void setup() override;
-  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::HARDWARE; }
 
