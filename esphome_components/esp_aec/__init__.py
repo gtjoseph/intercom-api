@@ -1,10 +1,10 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_MODE, CONF_SAMPLE_RATE
 from esphome.core import CORE
 from esphome.components.esp32 import add_idf_component
 
-CODEOWNERS = ["@daniele"]
+CODEOWNERS = ["@n-IA-hane"]
 DEPENDENCIES = ["esp32"]
 
 # Only available on ESP32-S3 with ESP-SR
@@ -18,9 +18,7 @@ def _validate_esp32s3(config):
 esp_aec_ns = cg.esphome_ns.namespace("esp_aec")
 EspAec = esp_aec_ns.class_("EspAec", cg.Component)
 
-CONF_SAMPLE_RATE = "sample_rate"
 CONF_FILTER_LENGTH = "filter_length"
-CONF_MODE = "mode"
 
 AEC_MODES = {
     "sr_low_cost": 0,      # AEC_MODE_SR_LOW_COST

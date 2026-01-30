@@ -2,20 +2,22 @@
 
 #ifdef USE_ESP32
 
-#include "esphome/core/log.h"
-#include "esphome/core/application.h"
-#include <esp_heap_caps.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+
+#include <esp_heap_caps.h>
+
+#include "esphome/core/hal.h"
+#include "esphome/core/log.h"
 
 namespace esphome {
 namespace intercom_api {
 
-static const char *TAG = "intercom_api";
+static const char *const TAG = "intercom_api";
 
 void IntercomApi::setup() {
   ESP_LOGI(TAG, "Setting up Intercom API...");
@@ -51,9 +53,9 @@ void IntercomApi::setup() {
   }
 
   // Allocate frame buffers
-  this->tx_buffer_ = (uint8_t *)heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL);
-  this->rx_buffer_ = (uint8_t *)heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL);
-  this->audio_tx_buffer_ = (uint8_t *)heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL);
+  this->tx_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL));
+  this->rx_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL));
+  this->audio_tx_buffer_ = static_cast<uint8_t *>(heap_caps_malloc(MAX_MESSAGE_SIZE, MALLOC_CAP_INTERNAL));
 
   if (!this->tx_buffer_ || !this->rx_buffer_ || !this->audio_tx_buffer_) {
     ESP_LOGE(TAG, "Failed to allocate frame buffers");
@@ -84,10 +86,10 @@ void IntercomApi::setup() {
       this->spk_ref_buffer_ = RingBuffer::create(AEC_REF_DELAY_BYTES + RX_BUFFER_SIZE);
 
       // Allocate AEC frame buffers
-      const size_t frame_bytes = (size_t)this->aec_frame_samples_ * sizeof(int16_t);
-      this->aec_mic_ = (int16_t *)heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      this->aec_ref_ = (int16_t *)heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      this->aec_out_ = (int16_t *)heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      const size_t frame_bytes = static_cast<size_t>(this->aec_frame_samples_) * sizeof(int16_t);
+      this->aec_mic_ = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      this->aec_ref_ = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      this->aec_out_ = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
       if (!this->spk_ref_mutex_ || !this->spk_ref_buffer_ ||
           !this->aec_mic_ || !this->aec_ref_ || !this->aec_out_) {
@@ -460,11 +462,11 @@ void IntercomApi::reset_aec_buffers_() {
     // Pre-fill reference buffer with silence to create delay
     // This compensates for I2S DMA latency + acoustic delay
     // The mic captures echo from audio played ~80ms ago, so we delay the reference
-    uint8_t *silence = (uint8_t *) heap_caps_calloc(1, AEC_REF_DELAY_BYTES, MALLOC_CAP_INTERNAL);
+    auto *silence = static_cast<uint8_t *>(heap_caps_calloc(1, AEC_REF_DELAY_BYTES, MALLOC_CAP_INTERNAL));
     if (silence) {
       this->spk_ref_buffer_->write(silence, AEC_REF_DELAY_BYTES);
       heap_caps_free(silence);
-      ESP_LOGD(TAG, "AEC buffers reset, pre-filled %ums silence", (unsigned)AEC_REF_DELAY_MS);
+      ESP_LOGD(TAG, "AEC buffers reset, pre-filled %ums silence", static_cast<unsigned>(AEC_REF_DELAY_MS));
     }
     xSemaphoreGive(this->spk_ref_mutex_);
   }
@@ -621,7 +623,7 @@ void IntercomApi::publish_contacts_() {
     // Full list available via get_contacts_csv() if needed
     char buf[32];
     snprintf(buf, sizeof(buf), "%d contact%s",
-             (int)this->contacts_.size(),
+             static_cast<int>(this->contacts_.size()),
              this->contacts_.size() == 1 ? "" : "s");
     this->contacts_sensor_->publish_state(buf);
   }
@@ -803,7 +805,7 @@ void IntercomApi::server_task_() {
     // Client mode - only connect when active
     if (this->client_mode_) {
       if (!this->active_.load(std::memory_order_acquire)) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        delay(100);
         continue;
       }
       if (this->client_.socket.load() < 0) {
@@ -813,7 +815,7 @@ void IntercomApi::server_task_() {
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock < 0) {
           ESP_LOGE(TAG, "Failed to create client socket: %d", errno);
-          vTaskDelay(pdMS_TO_TICKS(1000));
+          delay(1000);
           continue;
         }
 
@@ -827,11 +829,11 @@ void IntercomApi::server_task_() {
         addr.sin_port = htons(this->remote_port_);
         inet_pton(AF_INET, this->remote_host_.c_str(), &addr.sin_addr);
 
-        int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+        int ret = connect(sock, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
         if (ret < 0 && errno != EINPROGRESS) {
           ESP_LOGE(TAG, "Connect failed: %d", errno);
           close(sock);
-          vTaskDelay(pdMS_TO_TICKS(1000));
+          delay(1000);
           continue;
         }
 
@@ -845,7 +847,7 @@ void IntercomApi::server_task_() {
         if (ret <= 0) {
           ESP_LOGE(TAG, "Connect timeout");
           close(sock);
-          vTaskDelay(pdMS_TO_TICKS(1000));
+          delay(1000);
           continue;
         }
 
@@ -856,7 +858,7 @@ void IntercomApi::server_task_() {
         if (error != 0) {
           ESP_LOGE(TAG, "Connect error: %d", error);
           close(sock);
-          vTaskDelay(pdMS_TO_TICKS(1000));
+          delay(1000);
           continue;
         }
 
@@ -878,7 +880,7 @@ void IntercomApi::server_task_() {
       // Server mode - listen for connections
       if (this->server_socket_ < 0) {
         if (!this->setup_server_socket_()) {
-          vTaskDelay(pdMS_TO_TICKS(1000));
+          delay(1000);
           continue;
         }
       }
@@ -937,7 +939,7 @@ void IntercomApi::server_task_() {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1));  // Yield
+    delay(1);  // Yield
   }
 }
 
@@ -961,13 +963,13 @@ void IntercomApi::tx_task_() {
       // Reset AEC accumulator when paused
       this->aec_mic_fill_ = 0;
 #endif
-      vTaskDelay(pdMS_TO_TICKS(20));
+      delay(20);
       continue;
     }
 
     // Read from mic buffer
     if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(5)) != pdTRUE) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      delay(1);
       continue;
     }
 
@@ -975,7 +977,7 @@ void IntercomApi::tx_task_() {
     if (avail < AUDIO_CHUNK_SIZE) {
       xSemaphoreGive(this->mic_mutex_);
       // No data, short sleep
-      vTaskDelay(pdMS_TO_TICKS(2));
+      delay(2);
       continue;
     }
 
@@ -994,12 +996,12 @@ void IntercomApi::tx_task_() {
 
       // Copy mic samples to accumulator
       size_t samples_to_copy = std::min(num_samples,
-                                        (size_t)this->aec_frame_samples_ - this->aec_mic_fill_);
+                                        static_cast<size_t>(this->aec_frame_samples_) - this->aec_mic_fill_);
       memcpy(this->aec_mic_ + this->aec_mic_fill_, mic_samples, samples_to_copy * sizeof(int16_t));
       this->aec_mic_fill_ += samples_to_copy;
 
       // If we have a full AEC frame, process it
-      if (this->aec_mic_fill_ >= (size_t)this->aec_frame_samples_) {
+      if (this->aec_mic_fill_ >= static_cast<size_t>(this->aec_frame_samples_)) {
         // Read speaker reference from buffer (same frame size)
         size_t ref_bytes_needed = this->aec_frame_samples_ * sizeof(int16_t);
 
@@ -1030,13 +1032,13 @@ void IntercomApi::tx_task_() {
         if (++aec_frame_count % 500 == 0) {
           int64_t mic_sum = 0, ref_sum = 0, out_sum = 0;
           for (int i = 0; i < this->aec_frame_samples_; i++) {
-            mic_sum += (int64_t)this->aec_mic_[i] * this->aec_mic_[i];
-            ref_sum += (int64_t)this->aec_ref_[i] * this->aec_ref_[i];
-            out_sum += (int64_t)this->aec_out_[i] * this->aec_out_[i];
+            mic_sum += static_cast<int64_t>(this->aec_mic_[i]) * this->aec_mic_[i];
+            ref_sum += static_cast<int64_t>(this->aec_ref_[i]) * this->aec_ref_[i];
+            out_sum += static_cast<int64_t>(this->aec_out_[i]) * this->aec_out_[i];
           }
-          int mic_rms = (int)sqrt((double)mic_sum / this->aec_frame_samples_);
-          int ref_rms = (int)sqrt((double)ref_sum / this->aec_frame_samples_);
-          int out_rms = (int)sqrt((double)out_sum / this->aec_frame_samples_);
+          int mic_rms = static_cast<int>(std::sqrt(static_cast<double>(mic_sum) / this->aec_frame_samples_));
+          int ref_rms = static_cast<int>(std::sqrt(static_cast<double>(ref_sum) / this->aec_frame_samples_));
+          int out_rms = static_cast<int>(std::sqrt(static_cast<double>(out_sum) / this->aec_frame_samples_));
           int reduction = (mic_rms > 0) ? (100 - (out_rms * 100 / mic_rms)) : 0;
           ESP_LOGD(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% reduction)",
                    (unsigned long)aec_frame_count, mic_rms, ref_rms, out_rms, reduction);
@@ -1142,14 +1144,14 @@ void IntercomApi::speaker_task_() {
       }
       // Wait for next activation
       while (this->speaker_stop_requested_.load(std::memory_order_acquire)) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        delay(10);
       }
       continue;
     }
 
     // Wait until active
     if (!this->active_.load(std::memory_order_acquire) || this->speaker_ == nullptr) {
-      vTaskDelay(pdMS_TO_TICKS(20));
+      delay(20);
       continue;
     }
 
@@ -1163,7 +1165,7 @@ void IntercomApi::speaker_task_() {
     if (avail < AUDIO_CHUNK_SIZE) {
       xSemaphoreGive(this->speaker_mutex_);
       // Very short delay when buffer is empty
-      vTaskDelay(pdMS_TO_TICKS(1));
+      delay(1);
       continue;
     }
 
@@ -1211,7 +1213,7 @@ void IntercomApi::speaker_task_() {
 #else
   // No speaker, just idle
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    delay(1000);
   }
 #endif
 }
@@ -1248,7 +1250,7 @@ bool IntercomApi::send_message_(int socket, MessageType type, MessageFlags flags
     ssize_t sent = send(socket, this->tx_buffer_ + offset, total - offset, MSG_DONTWAIT);
 
     if (sent > 0) {
-      offset += (size_t)sent;
+      offset += static_cast<size_t>(sent);
       continue;
     }
 
@@ -1265,7 +1267,7 @@ bool IntercomApi::send_message_(int socket, MessageType type, MessageFlags flags
         xSemaphoreGive(this->send_mutex_);
         return false;
       }
-      vTaskDelay(pdMS_TO_TICKS(1));
+      delay(1);
       continue;
     }
 
@@ -1300,7 +1302,7 @@ bool IntercomApi::receive_message_(int socket, MessageHeader &header, uint8_t *b
     // received < 0
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       retry++;
-      vTaskDelay(pdMS_TO_TICKS(1));
+      delay(1);
       continue;
     }
     return false;  // Real error
@@ -1337,7 +1339,7 @@ bool IntercomApi::receive_message_(int socket, MessageHeader &header, uint8_t *b
       }
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         retry++;
-        vTaskDelay(pdMS_TO_TICKS(1));
+        delay(1);
         continue;
       }
       return false;
@@ -1359,7 +1361,7 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
     case MessageType::AUDIO:
       // Write to speaker buffer with overflow tracking
       if (xSemaphoreTake(this->speaker_mutex_, pdMS_TO_TICKS(1)) == pdTRUE) {
-        size_t written = this->speaker_buffer_->write((void *)data, header.length);
+        size_t written = this->speaker_buffer_->write(const_cast<uint8_t *>(data), header.length);
         xSemaphoreGive(this->speaker_mutex_);
         if (written != header.length) {
           static uint32_t spk_drop = 0;
@@ -1518,7 +1520,7 @@ bool IntercomApi::setup_server_socket_() {
   addr.sin_addr.s_addr = INADDR_ANY;
   addr.sin_port = htons(INTERCOM_PORT);
 
-  if (bind(this->server_socket_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (bind(this->server_socket_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
     ESP_LOGE(TAG, "Bind failed: %d", errno);
     close(this->server_socket_);
     this->server_socket_ = -1;
@@ -1562,7 +1564,7 @@ void IntercomApi::accept_client_() {
   struct sockaddr_in client_addr;
   socklen_t client_len = sizeof(client_addr);
 
-  int client_sock = accept(this->server_socket_, (struct sockaddr *)&client_addr, &client_len);
+  int client_sock = accept(this->server_socket_, reinterpret_cast<struct sockaddr *>(&client_addr), &client_len);
   if (client_sock < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
       ESP_LOGW(TAG, "Accept error: %d", errno);
@@ -1671,7 +1673,7 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
   } else {
     // Direct passthrough (gain=1.0, no DC offset)
     if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
-      this->mic_buffer_->write((void *)data, len);
+      this->mic_buffer_->write(const_cast<uint8_t *>(data), len);
       xSemaphoreGive(this->mic_mutex_);
     } else {
       static uint32_t mic_drops = 0;

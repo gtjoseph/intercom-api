@@ -18,7 +18,7 @@ from esphome.core import coroutine_with_priority, CORE
 
 CODEOWNERS = ["@n-IA-hane"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["switch", "number", "button", "text_sensor"]
+AUTO_LOAD = ["switch", "number", "text_sensor"]
 
 # Config keys for auto-generated sensors
 CONF_STATE_SENSOR = "state_sensor"
