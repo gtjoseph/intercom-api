@@ -4,6 +4,7 @@
 
 #include <cmath>
 
+#include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
@@ -419,9 +420,15 @@ void I2SAudioDuplex::audio_task_() {
   int16_t *spk_ref_buffer = nullptr;
   int16_t *aec_output = nullptr;
 
+  // Stereo split needs spk_ref_buffer even without AEC
+  if (this->use_stereo_aec_ref_) {
+    spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL));
+  }
+
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr) {
-    spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL));
+    if (!spk_ref_buffer)
+      spk_ref_buffer = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL));
     aec_output = static_cast<int16_t *>(heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL));
   }
 #endif
@@ -477,7 +484,6 @@ void I2SAudioDuplex::audio_task_() {
         }
 
 #ifdef USE_ESP_AEC
-        // Process through AEC if enabled and initialized
         if (this->aec_ != nullptr && this->aec_enabled_ && this->aec_->is_initialized() &&
             spk_ref_buffer != nullptr && aec_output != nullptr) {
 

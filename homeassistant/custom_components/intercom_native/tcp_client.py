@@ -297,7 +297,12 @@ class IntercomTcpClient:
         _LOGGER.debug("[TCP#%d] Receive loop started", self._instance_id)
         try:
             while self._connected and self._reader:
-                header_data = await self._reader.readexactly(HEADER_SIZE)
+                # Timeout detects dead connections (ESP crash without TCP FIN)
+                # Idle: ping every 30s, so 60s is safe. Streaming: audio every 16ms, 5s is generous.
+                read_timeout = 5.0 if self._streaming else 60.0
+                header_data = await asyncio.wait_for(
+                    self._reader.readexactly(HEADER_SIZE), timeout=read_timeout
+                )
                 msg_type, flags, length = struct.unpack("<BBH", header_data)
 
                 payload = b""
@@ -307,10 +312,15 @@ class IntercomTcpClient:
                         _LOGGER.error("[TCP#%d] Protocol desync: bad length %d (max %d), closing",
                                      self._instance_id, length, MAX_PAYLOAD_SIZE)
                         raise ConnectionError("protocol desync")
-                    payload = await self._reader.readexactly(length)
+                    payload = await asyncio.wait_for(
+                        self._reader.readexactly(length), timeout=read_timeout
+                    )
 
                 await self._handle_message(msg_type, flags, payload)
 
+        except asyncio.TimeoutError:
+            _LOGGER.warning("[TCP#%d] Read timeout (streaming=%s) - connection dead",
+                           self._instance_id, self._streaming)
         except asyncio.IncompleteReadError:
             _LOGGER.info("[TCP#%d] Connection closed by peer", self._instance_id)
         except asyncio.CancelledError:

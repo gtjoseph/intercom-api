@@ -710,6 +710,11 @@ display:
           it.print(cx, 100, id(font_state), id(color_green), TextAlign::CENTER, "IDLE");
           it.print(cx, 130, id(font_debug), id(color_white), TextAlign::CENTER, "Destination:");
           it.print(cx, 150, id(font_info), id(color_white), TextAlign::CENTER, id(peer_name).c_str());
+          char contacts_buf[48];
+          auto csv = id(intercom).get_contacts_csv();
+          int count = csv.empty() ? 0 : std::count(csv.begin(), csv.end(), ',') + 1;
+          snprintf(contacts_buf, sizeof(contacts_buf), "Contacts: %d", count);
+          it.print(cx, 185, id(font_debug), id(color_white), TextAlign::CENTER, contacts_buf);
           char buf[32];
           snprintf(buf, sizeof(buf), "WiFi: %.0f%%", id(wifi_pct).state);
           it.print(cx, h - 35, id(font_debug), id(color_white), TextAlign::CENTER, buf);
